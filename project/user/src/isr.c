@@ -1,69 +1,72 @@
 /*********************************************************************************************************************
-* RT1064DVL6A Opensource Library ¼´£¨RT1064DVL6A ¿ªÔ´¿â£©ÊÇÒ»¸ö»ùÓÚ¹Ù·½ SDK ½Ó¿ÚµÄµÚÈı·½¿ªÔ´¿â
-* Copyright (c) 2022 SEEKFREE Öğ·É¿Æ¼¼
-* 
-* ±¾ÎÄ¼şÊÇ RT1064DVL6A ¿ªÔ´¿âµÄÒ»²¿·Ö
-* 
-* RT1064DVL6A ¿ªÔ´¿â ÊÇÃâ·ÑÈí¼ş
-* Äú¿ÉÒÔ¸ù¾İ×ÔÓÉÈí¼ş»ù½ğ»á·¢²¼µÄ GPL£¨GNU General Public License£¬¼´ GNUÍ¨ÓÃ¹«¹²Ğí¿ÉÖ¤£©µÄÌõ¿î
-* ¼´ GPL µÄµÚ3°æ£¨¼´ GPL3.0£©»ò£¨ÄúÑ¡ÔñµÄ£©ÈÎºÎºóÀ´µÄ°æ±¾£¬ÖØĞÂ·¢²¼ºÍ/»òĞŞ¸ÄËü
-* 
-* ±¾¿ªÔ´¿âµÄ·¢²¼ÊÇÏ£ÍûËüÄÜ·¢»Ó×÷ÓÃ£¬µ«²¢Î´¶ÔÆä×÷ÈÎºÎµÄ±£Ö¤
-* ÉõÖÁÃ»ÓĞÒşº¬µÄÊÊÏúĞÔ»òÊÊºÏÌØ¶¨ÓÃÍ¾µÄ±£Ö¤
-* ¸ü¶àÏ¸½ÚÇë²Î¼û GPL
-* 
-* ÄúÓ¦¸ÃÔÚÊÕµ½±¾¿ªÔ´¿âµÄÍ¬Ê±ÊÕµ½Ò»·İ GPL µÄ¸±±¾
-* Èç¹ûÃ»ÓĞ£¬Çë²ÎÔÄ<https://www.gnu.org/licenses/>
-* 
-* ¶îÍâ×¢Ã÷£º
-* ±¾¿ªÔ´¿âÊ¹ÓÃ GPL3.0 ¿ªÔ´Ğí¿ÉÖ¤Ğ­Òé ÒÔÉÏĞí¿ÉÉêÃ÷ÎªÒëÎÄ°æ±¾
-* Ğí¿ÉÉêÃ÷Ó¢ÎÄ°æÔÚ libraries/doc ÎÄ¼ş¼ĞÏÂµÄ GPL3_permission_statement.txt ÎÄ¼şÖĞ
-* Ğí¿ÉÖ¤¸±±¾ÔÚ libraries ÎÄ¼ş¼ĞÏÂ ¼´¸ÃÎÄ¼ş¼ĞÏÂµÄ LICENSE ÎÄ¼ş
-* »¶Ó­¸÷Î»Ê¹ÓÃ²¢´«²¥±¾³ÌĞò µ«ĞŞ¸ÄÄÚÈİÊ±±ØĞë±£ÁôÖğ·É¿Æ¼¼µÄ°æÈ¨ÉùÃ÷£¨¼´±¾ÉùÃ÷£©
-* 
-* ÎÄ¼şÃû³Æ          isr
-* ¹«Ë¾Ãû³Æ          ³É¶¼Öğ·É¿Æ¼¼ÓĞÏŞ¹«Ë¾
-* °æ±¾ĞÅÏ¢          ²é¿´ libraries/doc ÎÄ¼ş¼ĞÄÚ version ÎÄ¼ş °æ±¾ËµÃ÷
-* ¿ª·¢»·¾³          IAR 8.32.4 or MDK 5.33
-* ÊÊÓÃÆ½Ì¨          RT1064DVL6A
-* µêÆÌÁ´½Ó          https://seekfree.taobao.com/
-* 
-* ĞŞ¸Ä¼ÇÂ¼
-* ÈÕÆÚ              ×÷Õß                ±¸×¢
-* 2022-09-21        SeekFree            first version
-********************************************************************************************************************/
+* æ–‡ä»¶åç§°          isr.c
+* é€‚ç”¨å¹³å°          RT1064DVL6A
+* æè¿°              ä¸­æ–­æœåŠ¡å‡½æ•°
+*
+* åˆ†é¢‘è®¾è®¡ï¼ˆä¸ summer-smartcar çš„åˆ†å±‚æ€æƒ³ä¸€è‡´ï¼‰ï¼š
+*       PIT_CH0  5ms   200Hz   ç¼–ç å™¨é‡‡æ · + å››è½®é€Ÿåº¦ç¯ + IMU å§¿æ€é‡‡æ ·
+*       PIT_CH1  10ms  100Hz   æŒ‰é”®æ‰«æ
+*       è§†è§‰ä¸å†³ç­–åœ¨ä¸»å¾ªç¯ï¼ˆè·Ÿæ‘„åƒå¤´å¸§ç‡èµ°ï¼Œçº¦ 50Hzï¼‰
+*
+* æ³¨æ„ï¼šISR é‡Œåªåšç¡®å®šæ€§çš„çŸ­å·¥ä½œï¼ˆè¯»ç¼–ç å™¨ã€PIDã€ä¸‹å‘ PWMï¼‰ï¼Œ
+*       ç»ä¸åšè§†è§‰ã€æ‰“å°ã€å±å¹•å†™å…¥ï¼Œå¦åˆ™ä¼šæ‹–æ…¢å†…ç¯ã€‚
+*********************************************************************************************************************/
 
 #include "zf_common_headfile.h"
 #include "zf_common_debug.h"
 #include "isr.h"
 
+#include "config.h"
+#include "encoder.h"
+#include "imu.h"
+#include "pid.h"
 
-
-
-void CSI_IRQHandler(void)
+//-------------------------------------------------------------------------------------------------------------------
+// å‡½æ•°ç®€ä»‹     200Hz å†…ç¯å¤„ç†ï¼šç¼–ç å™¨é‡‡æ · + IMU + å››è½®é€Ÿåº¦ç¯
+// å¤‡æ³¨ä¿¡æ¯     åªåšç¡®å®šæ€§çŸ­å·¥ä½œï¼Œç¦æ­¢è§†è§‰/æ‰“å°/å†™å±
+//-------------------------------------------------------------------------------------------------------------------
+void pit_handler_200hz(void)
 {
-    CSI_DriverIRQHandler();     // µ÷ÓÃSDK×Ô´øµÄÖĞ¶Ïº¯Êı Õâ¸öº¯Êı×îºó»áµ÷ÓÃÎÒÃÇÉèÖÃµÄ»Øµ÷º¯Êı
-    __DSB();                    // Êı¾İÍ¬²½¸ôÀë
+#if ENCODER_ENABLE
+    encoder_pit_callback();                                                 // ç¼–ç å™¨åˆ°è´§åæ¢å¤ç¡¬ä»¶é‡‡æ ·
+#endif
+    imu_update();                                                           // é™€èºä»ªé‡‡æ ·ï¼ˆæ»¤æ³¢å™¨çŠ¶æ€ 200Hz æ›´æ–°ï¼‰
+    Speed_PID_Crtl();                                                       // å››è½®é€Ÿåº¦ç¯ â†’ PWM
 }
 
+//-------------------------------------------------------------------------------------------------------------------
+// å‡½æ•°ç®€ä»‹     100Hz å¤„ç†ï¼šæŒ‰é”®æ‰«æ
+// å¤‡æ³¨ä¿¡æ¯     åªæ‰«æçŠ¶æ€ï¼›æŒ‰é”®åŠ¨ä½œç”±ä¸»å¾ªç¯ buttons_poll() å¤„ç†ï¼ˆæ— å±ï¼ŒæŒ‰é”®ä»…ç”¨äºå‘è½¦/åœè½¦ï¼‰
+//-------------------------------------------------------------------------------------------------------------------
+void pit_handler_100hz(void)
+{
+    key_scanner();
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// å‡½æ•°ç®€ä»‹     PIT å‘¨æœŸä¸­æ–­æœåŠ¡å‡½æ•°
+// å¤‡æ³¨ä¿¡æ¯     CH0 ä¸ CH1 å…±ç”¨ä¸€ä¸ªä¸­æ–­å‘é‡ï¼Œé  pit_flag_get åŒºåˆ†
+//-------------------------------------------------------------------------------------------------------------------
 void PIT_IRQHandler(void)
 {
-    if(pit_flag_get(PIT_CH0))
+    if (pit_flag_get(PIT_CH0))
     {
+        pit_handler_200hz();
         pit_flag_clear(PIT_CH0);
     }
-    
-    if(pit_flag_get(PIT_CH1))
+
+    if (pit_flag_get(PIT_CH1))
     {
+        pit_handler_100hz();
         pit_flag_clear(PIT_CH1);
     }
-    
-    if(pit_flag_get(PIT_CH2))
+
+    if (pit_flag_get(PIT_CH2))
     {
         pit_flag_clear(PIT_CH2);
     }
-    
-    if(pit_flag_get(PIT_CH3))
+
+    if (pit_flag_get(PIT_CH3))
     {
         pit_flag_clear(PIT_CH3);
     }
@@ -71,274 +74,39 @@ void PIT_IRQHandler(void)
     __DSB();
 }
 
+//-------------------------------------------------------------------------------------------------------------------
+// æ‘„åƒå¤´ CSI ä¸­æ–­ï¼šSDK å†…éƒ¨ä¼šå›è°ƒ mt9v03x çš„åœºä¸­æ–­å¤„ç†ï¼Œæœ€ç»ˆç½®ä½ mt9v03x_finish_flag
+//-------------------------------------------------------------------------------------------------------------------
+void CSI_IRQHandler(void)
+{
+    CSI_DriverIRQHandler();
+    __DSB();                                                                // æ•°æ®åŒæ­¥éš”ç¦»
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// è°ƒè¯•ä¸²å£ï¼ˆLPUART1ï¼ŒB12/B13ï¼‰
+//-------------------------------------------------------------------------------------------------------------------
 void LPUART1_IRQHandler(void)
 {
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
+    if (kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
-        // ½ÓÊÕÖĞ¶Ï
-    #if DEBUG_UART_USE_INTERRUPT                        // Èç¹û¿ªÆô debug ´®¿ÚÖĞ¶Ï
-        debug_interrupr_handler();                      // µ÷ÓÃ debug ´®¿Ú½ÓÊÕ´¦Àíº¯Êı Êı¾İ»á±» debug »·ĞÎ»º³åÇø¶ÁÈ¡
-    #endif                                              // Èç¹ûĞŞ¸ÄÁË DEBUG_UART_INDEX ÄÇÕâ¶Î´úÂëĞèÒª·Åµ½¶ÔÓ¦µÄ´®¿ÚÖĞ¶ÏÈ¥
+    #if DEBUG_UART_USE_INTERRUPT                                            // å¦‚æœå¼€å¯ debug ä¸²å£ä¸­æ–­
+        debug_interrupr_handler();                                          // æ•°æ®è¿› debug ç¯å½¢ç¼“å†²åŒº
+    #endif
     }
-        
-    LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);    // ²»ÔÊĞíÉ¾³ı
+
+    LPUART_ClearStatusFlags(LPUART1, kLPUART_RxOverrunFlag);                // ä¸å…è®¸åˆ é™¤
 }
 
-void LPUART2_IRQHandler(void)
-{
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART2))
-    {
-        // ½ÓÊÕÖĞ¶Ï
-        
-    }
-        
-    LPUART_ClearStatusFlags(LPUART2, kLPUART_RxOverrunFlag);    // ²»ÔÊĞíÉ¾³ı
-}
-
-void LPUART3_IRQHandler(void)
-{
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART3))
-    {
-        // ½ÓÊÕÖĞ¶Ï
-        
-    }
-        
-    LPUART_ClearStatusFlags(LPUART3, kLPUART_RxOverrunFlag);    // ²»ÔÊĞíÉ¾³ı
-}
-
-void LPUART4_IRQHandler(void)
-{
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART4))
-    {
-        // ½ÓÊÕÖĞ¶Ï 
-        flexio_camera_uart_handler();
-        
-        gnss_uart_callback();
-    }
-        
-    LPUART_ClearStatusFlags(LPUART4, kLPUART_RxOverrunFlag);    // ²»ÔÊĞíÉ¾³ı
-}
-
-void LPUART5_IRQHandler(void)
-{
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART5))
-    {
-        // ½ÓÊÕÖĞ¶Ï
-        camera_uart_handler();
-    }
-        
-    LPUART_ClearStatusFlags(LPUART5, kLPUART_RxOverrunFlag);    // ²»ÔÊĞíÉ¾³ı
-}
-
+//-------------------------------------------------------------------------------------------------------------------
+// é¥æµ‹ä¸²å£ï¼ˆLPUART6ï¼ŒB2/B3ï¼‰ï¼šæœ¬å·¥ç¨‹åªå‘ä¸æ”¶ï¼Œä»…æ¸…æ ‡å¿—
+//-------------------------------------------------------------------------------------------------------------------
 void LPUART6_IRQHandler(void)
 {
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART6))
+    if (kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART6))
     {
-        // ½ÓÊÕÖĞ¶Ï
-        
-    }
-        
-    LPUART_ClearStatusFlags(LPUART6, kLPUART_RxOverrunFlag);    // ²»ÔÊĞíÉ¾³ı
-}
-
-
-void LPUART8_IRQHandler(void)
-{
-    if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART8))
-    {
-        // ½ÓÊÕÖĞ¶Ï
-        wireless_module_uart_handler();
-        
-    }
-        
-    LPUART_ClearStatusFlags(LPUART8, kLPUART_RxOverrunFlag);    // ²»ÔÊĞíÉ¾³ı
-}
-
-
-void GPIO1_Combined_0_15_IRQHandler(void)
-{
-    if(exti_flag_get(B0))
-    {
-        exti_flag_clear(B0);// Çå³ıÖĞ¶Ï±êÖ¾Î»
-    }
-    
-}
-
-
-void GPIO1_Combined_16_31_IRQHandler(void)
-{
-    wireless_module_spi_handler();
-    if(exti_flag_get(B16))
-    {
-        exti_flag_clear(B16); // Çå³ıÖĞ¶Ï±êÖ¾Î»
+        /* é¢„ç•™ï¼šå¦‚æœä»¥åè¦æ¥æ”¶ä¸Šä½æœºæŒ‡ä»¤ï¼Œåœ¨è¿™é‡Œè§£æ */
     }
 
-    
+    LPUART_ClearStatusFlags(LPUART6, kLPUART_RxOverrunFlag);                // ä¸å…è®¸åˆ é™¤
 }
-
-void GPIO2_Combined_0_15_IRQHandler(void)
-{
-    flexio_camera_vsync_handler();
-    
-    if(exti_flag_get(C0))
-    {
-        exti_flag_clear(C0);// Çå³ıÖĞ¶Ï±êÖ¾Î»
-    }
-
-}
-
-void GPIO2_Combined_16_31_IRQHandler(void)
-{
-    // -----------------* ToF INT ¸üĞÂÖĞ¶Ï Ô¤ÖÃÖĞ¶Ï´¦Àíº¯Êı *-----------------
-    tof_module_exti_handler();
-    // -----------------* ToF INT ¸üĞÂÖĞ¶Ï Ô¤ÖÃÖĞ¶Ï´¦Àíº¯Êı *-----------------
-    
-    if(exti_flag_get(C16))
-    {
-        exti_flag_clear(C16); // Çå³ıÖĞ¶Ï±êÖ¾Î»
-    }
-    
-}
-
-
-
-
-void GPIO3_Combined_0_15_IRQHandler(void)
-{
-    if(exti_flag_get(IMU660RC_INT2_PIN))
-    {
-		imu660rc_callback();
-        exti_flag_clear(IMU660RC_INT2_PIN);// Çå³ıÖĞ¶Ï±êÖ¾Î»
-    }
-    if(exti_flag_get(D4))
-    {
-        exti_flag_clear(D4);// Çå³ıÖĞ¶Ï±êÖ¾Î»
-    }
-}
-
-
-
-
-
-
-
-
-
-/*
-ÖĞ¶Ïº¯ÊıÃû³Æ£¬ÓÃÓÚÉèÖÃ¶ÔÓ¦¹¦ÄÜµÄÖĞ¶Ïº¯Êı
-Sample usage:µ±Ç°ÆôÓÃÁËÖÜÆÚ¶¨Ê±Æ÷ÖĞ¶Ï
-void PIT_IRQHandler(void)
-{
-    //Îñ±ØÇå³ı±êÖ¾Î»
-    __DSB();
-}
-¼ÇµÃ½øÈëÖĞ¶ÏºóÇå³ı±êÖ¾Î»
-CTI0_ERROR_IRQHandler
-CTI1_ERROR_IRQHandler
-CORE_IRQHandler
-FLEXRAM_IRQHandler
-KPP_IRQHandler
-TSC_DIG_IRQHandler
-GPR_IRQ_IRQHandler
-LCDIF_IRQHandler
-CSI_IRQHandler
-PXP_IRQHandler
-WDOG2_IRQHandler
-SNVS_HP_WRAPPER_IRQHandler
-SNVS_HP_WRAPPER_TZ_IRQHandler
-SNVS_LP_WRAPPER_IRQHandler
-CSU_IRQHandler
-DCP_IRQHandler
-DCP_VMI_IRQHandler
-Reserved68_IRQHandler
-TRNG_IRQHandler
-SJC_IRQHandler
-BEE_IRQHandler
-PMU_EVENT_IRQHandler
-Reserved78_IRQHandler
-TEMP_LOW_HIGH_IRQHandler
-TEMP_PANIC_IRQHandler
-USB_PHY1_IRQHandler
-USB_PHY2_IRQHandler
-ADC1_IRQHandler
-ADC2_IRQHandler
-DCDC_IRQHandler
-Reserved86_IRQHandler
-Reserved87_IRQHandler
-GPIO1_INT0_IRQHandler
-GPIO1_INT1_IRQHandler
-GPIO1_INT2_IRQHandler
-GPIO1_INT3_IRQHandler
-GPIO1_INT4_IRQHandler
-GPIO1_INT5_IRQHandler
-GPIO1_INT6_IRQHandler
-GPIO1_INT7_IRQHandler
-GPIO1_Combined_0_15_IRQHandler
-GPIO1_Combined_16_31_IRQHandler
-GPIO2_Combined_0_15_IRQHandler
-GPIO2_Combined_16_31_IRQHandler
-GPIO3_Combined_0_15_IRQHandler
-GPIO3_Combined_16_31_IRQHandler
-GPIO4_Combined_0_15_IRQHandler
-GPIO4_Combined_16_31_IRQHandler
-GPIO5_Combined_0_15_IRQHandler
-GPIO5_Combined_16_31_IRQHandler
-WDOG1_IRQHandler
-RTWDOG_IRQHandler
-EWM_IRQHandler
-CCM_1_IRQHandler
-CCM_2_IRQHandler
-GPC_IRQHandler
-SRC_IRQHandler
-Reserved115_IRQHandler
-GPT1_IRQHandler
-GPT2_IRQHandler
-PWM1_0_IRQHandler
-PWM1_1_IRQHandler
-PWM1_2_IRQHandler
-PWM1_3_IRQHandler
-PWM1_FAULT_IRQHandler
-SEMC_IRQHandler
-USB_OTG2_IRQHandler
-USB_OTG1_IRQHandler
-XBAR1_IRQ_0_1_IRQHandler
-XBAR1_IRQ_2_3_IRQHandler
-ADC_ETC_IRQ0_IRQHandler
-ADC_ETC_IRQ1_IRQHandler
-ADC_ETC_IRQ2_IRQHandler
-ADC_ETC_ERROR_IRQ_IRQHandler
-PIT_IRQHandler
-ACMP1_IRQHandler
-ACMP2_IRQHandler
-ACMP3_IRQHandler
-ACMP4_IRQHandler
-Reserved143_IRQHandler
-Reserved144_IRQHandler
-ENC1_IRQHandler
-ENC2_IRQHandler
-ENC3_IRQHandler
-ENC4_IRQHandler
-TMR1_IRQHandler
-TMR2_IRQHandler
-TMR3_IRQHandler
-TMR4_IRQHandler
-PWM2_0_IRQHandler
-PWM2_1_IRQHandler
-PWM2_2_IRQHandler
-PWM2_3_IRQHandler
-PWM2_FAULT_IRQHandler
-PWM3_0_IRQHandler
-PWM3_1_IRQHandler
-PWM3_2_IRQHandler
-PWM3_3_IRQHandler
-PWM3_FAULT_IRQHandler
-PWM4_0_IRQHandler
-PWM4_1_IRQHandler
-PWM4_2_IRQHandler
-PWM4_3_IRQHandler
-PWM4_FAULT_IRQHandler
-Reserved171_IRQHandler
-GPIO6_7_8_9_IRQHandler*/
-
-
-

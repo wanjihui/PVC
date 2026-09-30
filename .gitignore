@@ -1,1 +1,29 @@
-project/mdk/rt1064.uvguix.ZT
+# 本地工具和说明，不上传到代码仓库
+/tool/
+/tools/
+/docs/
+
+# Keil 编译输出
+/project/mdk/Objects/
+/project/mdk/Listings/
+*.o
+*.d
+*.axf
+*.elf
+*.map
+*.lst
+*.lnp
+*.dep
+*.build_log.htm
+
+# IDE 个人界面、缓存和备份
+*.uvguix.*
+*.uvgui.*
+*.bak
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+
+# libraries 中的 .a / .lib 为工程依赖，应保留
