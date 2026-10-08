@@ -65,6 +65,15 @@ typedef struct
 
 extern VisionResult_t g_vis;
 
+/* 同一帧快照用于算法和上传；仅主循环调用，不在采集中断里处理图像。
+ * 上传布局：原始灰度 w*h 字节 + 每行4字节[left,right,center,repair_flags]。
+ * flags bit0/bit1分别表示左右补线，255表示无效列。 */
+#define VISION_MONITOR_SIZE (MT9V03X_IMAGE_SIZE + 4u * pho_h)
+uint8 vision_capture_frame(void);
+void vision_monitor_payload(uint8 *destination);
+extern volatile uint32 vis_interval_us, vis_processed_frames;
+extern volatile uint32 vis_last_event;
+
 /* ========== 全局量 ========== */
 extern uint8  asc_far;                                                      // ASC 采样远行（顶部行），菜单可调
 extern volatile uint8_t  vis_frame_ready;                                   // 新帧已搜线完成（供上行传输层判断数据是否新鲜）

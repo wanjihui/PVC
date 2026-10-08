@@ -85,6 +85,7 @@ char wifi_spi_ip_addr_port[25];                 // 保存模块IP地址与端口信息
 static fifo_struct  wifi_spi_fifo;
 static uint8        wifi_spi_buffer[WIFI_SPI_RECVIVE_FIFO_SIZE];
 static volatile     wifi_spi_state_enum wifi_spi_mutex;
+#include "zf_device_wifi_spi_async.inc"
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     等待WIFI SPI就绪
 // 参数说明     wait_time       最大等待时间 单位毫秒

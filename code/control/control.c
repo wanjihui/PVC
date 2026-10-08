@@ -1,12 +1,12 @@
 /*********************************************************************************************************************
 * 文件名称          control.c
 * 适用平台          RT1064DVL6A
-* 描述              运行状态机 + 视觉→运动决策 + 速度规划 + 麦轮运动学
+* 描述              运行状态机 + 视觉指令 + 500ms起步斜坡/陀螺阻尼 + 麦轮运动学
 *
 * 数据流（与 summer-smartcar 相同的分层思想，转向环换成麦轮自转）：
 *
 *   mt9v03x_image ──> vis_deal() ──> g_vis.err ─┬─> 转向环 ──> ω(deg/s) ─┐
-*                                              └─> 速度规划 ─> vx(cm/s) ─┤
+*                                              └─> 固定前进速度 ─> vx(cm/s) ─┤
 *                                                                        ├─> mecanum_inverse()
 *                                              vy(cm/s，横移，可选) ─────┘        │
 *                                                                                v
@@ -20,17 +20,24 @@
 #include "control.h"
 #include "config.h"
 
-/* ==================== 可调参数实体 ==================== */
+#if CAR_START_RAMP_MS == 0
+#error "CAR_START_RAMP_MS must be positive."
+#endif
+
+/* ==================== 可调参数实体 ====================
+ * 初值全部来自 config.h 的 CTL_*_DEFAULT；这里只做首次装载。
+ * 运行中可以直接改这些变量（菜单/VOFA 参数在线调），改 config.h 则影响上电初值。 */
 uint8  ctl_preview_row   = VIS_PREVIEW_ROW_DEFAULT;
-float  ctl_deadband      = 2.0f;
-float  ctl_omega_kp1     = 0.60f;
-float  ctl_omega_kp2     = 0.004f;
-float  ctl_omega_kd      = 0.30f;
-float  ctl_gyro_kd       = 0.08f;
-float  ctl_omega_max     = 120.0f;
-float  ctl_speed_straight = 120.0f;
-float  ctl_speed_curve    = 80.0f;
-float  ctl_lateral_gain   = 0.0f;
+float  ctl_deadband      = CTL_DEADBAND_PX_DEFAULT;
+float  ctl_omega_kp1     = CTL_OMEGA_KP1_DEFAULT;
+float  ctl_omega_kp2     = CTL_OMEGA_KP2_DEFAULT;
+float  ctl_omega_kd      = CTL_OMEGA_KD_DEFAULT;
+float  ctl_gyro_kd       = CTL_GYRO_KD_DEFAULT;   // 符号由 IMU_MOUNT_YAW_SIGN(-1) 保证：gyro_z 左转正
+float  ctl_omega_max     = CTL_OMEGA_MAX_DPS_DEFAULT;
+float  ctl_speed_target  = CAR_TARGET_SPEED_CMS;
+float  ctl_lateral_gain  = CTL_LATERAL_GAIN_DEFAULT;
+float  ctl_corner_err_px = CTL_CORNER_ERR_PX_DEFAULT;
+float  ctl_corner_slow   = CTL_CORNER_SLOW_RATIO_DEFAULT;
 
 /* ==================== 运行状态 ==================== */
 volatile CarState car_state    = CAR_IDLE;
@@ -43,31 +50,31 @@ volatile float    vy_dbg            = 0.0f;
 
 /* 内部状态 */
 static float  err_last        = 0.0f;                                       // 上一帧偏差（D 项用）
-static float  speed_filtered  = 0.0f;                                       // 速度 LPF 状态
+static volatile float vision_err_abs = 0.0f;                                // |err| 缓存：供5ms任务做弯道降速
 static uint16 stall_count     = 0;                                          // 堵转连续帧计数
-static uint16 stop_tick       = 0;                                          // 停车制动计时（50Hz 帧）
-
-/* 停车制动参数 */
-#define STOP_BRAKE_DUTY       (50)                                          // 停车阶段全力制动占空比
-#define STOP_TICK_MAX         (30)                                          // 30 帧 × 20ms = 0.6s 超时强制结束
-#define STOP_SPEED_EPS_CMS    (5.0f)                                        // 四轮速度均低于此值视为停稳
-
+static uint32 ramp_elapsed_ms = 0; // 只按5ms PIT步进，与主循环/WiFi/摄像头刷新快慢无关
+static volatile float vision_omega_command = 0.0f, vision_vy_command = 0.0f;
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     控制层初始化
 // 功能描述     参数同步 + 速度环初始化 + 视觉状态复位 + 陀螺仪零偏校准
-// 备注信息     control_init() 必须在 mt9v03x_init() 与 imu_init() 之后调用
+// 备注信息     IMU/编码器初始化后调用；视觉模式先初始化相机与图像计时器。
 //-------------------------------------------------------------------------------------------------------------------
 void control_init(void)
 {
     control_sync_params();
     Speed_PID_Init();
+#if APP_VISION_TRACKING_ENABLE
     vision_reset();
     cross_reset();
+#endif
     encoder_reset_distance();
 
     car_state   = CAR_IDLE;
     car_cmd     = 0;
     stop_reason = STOP_REASON_NONE;
+    ramp_elapsed_ms = 0;
+    vision_omega_command = vision_vy_command = 0.0f;
+    gyro_z_dbg = omega_dbg = speed_target_dbg = vy_dbg = 0.0f;
 
     imu_set_bias_tracking(1);                                               // 静止，开零偏跟踪
     motor_stop();
@@ -93,146 +100,66 @@ void control_sync_params(void)
 }
 
 //-------------------------------------------------------------------------------------------------------------------
-// 函数简介     发车：IDLE → LAUNCHING
-// 功能描述     清里程、复位视觉与 PID 中间量、进入开环起步
+// 函数简介     K1发车：进入RUNNING且全程闭环；vx从0在500ms内线性升到巡航速度。
 //-------------------------------------------------------------------------------------------------------------------
 void control_state_launch(void)
 {
-    uint8 i;
-
-    if (car_state != CAR_IDLE && car_state != CAR_STOP) return;
-
-    err_last       = 0.0f;
-    speed_filtered = 0.0f;
-    stall_count    = 0;
-    stop_tick      = 0;
-    stop_reason    = STOP_REASON_NONE;
-
-    for (i = 0; i < WHEEL_NUM; i++)
-    {
-        PID_INC_Init(&Motor_PID[i]);
-        Motor_PID[i].OutMax =  (float)MOTOR_DUTY_MAX;
-        Motor_PID[i].OutMin = -(float)MOTOR_DUTY_MAX;
-    }
-    Speed_PID_Sync_Params();
-
+    if (car_state != CAR_IDLE) return;
+    /* 在允许内环输出前，完整复位四轮PID和视觉状态。 */
+    Speed_PID_Enable = 0;
+    err_last = 0.0f;
+    stall_count = 0;
+    ramp_elapsed_ms = 0;
+    vision_omega_command = vision_vy_command = 0.0f;
+    omega_dbg = speed_target_dbg = vy_dbg = 0.0f;
+    stop_reason = STOP_REASON_NONE;
+    Speed_PID_Init();
     control_sync_params();
+#if APP_VISION_TRACKING_ENABLE
     vision_reset();
     cross_reset();
+#endif
     encoder_reset_distance();
-
-    launch_ol_tick         = 0;
-    launch_transition_tick = 0;
-    launch_ol_duty         = (float)CAR_LAUNCH_DUTY;
-#if ENCODER_ENABLE
-    launch_openloop        = 1;                                             // 编码器模式：固定PWM起步后切速度闭环
-#else
-    launch_openloop        = 0;                                             // 无编码器：跳过40%起步冲刺，直接用限幅开环映射
-#endif
-    Speed_PID_StopBrake    = 0;
-    Speed_PID_Enable       = 1;
-
-    imu_set_bias_tracking(0);                                               // 行驶中禁止零偏跟踪
-
-#if ENCODER_ENABLE
-    car_state = CAR_LAUNCHING;
-#else
+    imu_set_bias_tracking(0);
     car_state = CAR_RUNNING;
+    car_cmd = 1;
+#if APP_VISION_TRACKING_ENABLE
+    /* 先缓存视觉指令；下一拍5ms中断叠加陀螺阻尼与起步速度，再生成轮速目标。 */
+    control_update();
+#else
+    /* 调速模式不读图像；5ms斜坡和陀螺反馈仍有效，四轮PID全过程运行。 */
 #endif
+    Speed_PID_Enable = 1;
 }
 
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     停车：任意状态 → STOP（记录原因）
-// 参数说明     reason      StopReason 枚举值
+// 函数简介     停车：立即关闭速度环、清目标和PWM，回到等待K1状态。
 //-------------------------------------------------------------------------------------------------------------------
 void control_state_stop(uint8 reason)
 {
-    if (car_state == CAR_IDLE) return;
-
-    stop_reason       = reason;
-    car_state         = CAR_STOP;
-    stop_tick         = 0;
-    launch_openloop   = 0;
-    Speed_PID_Enable  = 0;                                                  // 关 PID，改由 control_stop_poll 制动
-    Speed_PID_StopBrake = 1;
-#if !ENCODER_ENABLE
-    /* 无速度反馈不能判断停稳或做反向制动，立即撤掉PWM，靠机械阻力滑停。
-     * 此处不依赖摄像头新帧，KEY_2在没有新图像时也能关掉输出。 */
-    motor_stop();
-#endif
-}
-
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     STOP 状态的制动轮询（50Hz 每帧调用）
-// 功能描述     1) 四轮 Target 归零（速度环会反向刹车）
-//              2) 停稳或超时后：PWM 归零、停车灯灭、回 IDLE
-//-------------------------------------------------------------------------------------------------------------------
-void control_stop_poll(void)
-{
     uint8 i;
-#if ENCODER_ENABLE
-    float vmax = 0.0f;
-    float v;
-
-    if (car_state != CAR_STOP) return;
-
-    stop_tick++;
-
-    for (i = 0; i < WHEEL_NUM; i++)
-    {
-        Motor_PID[i].Target = 0.0f;                                         // 目标 0 → 速度环反向制动
-        v = encoder_get_speed_cms((wheel_index_enum)i);
-        if (v < 0.0f) v = -v;
-        if (v > vmax) vmax = v;
-    }
-
-    Speed_PID_Enable    = 1;                                                // 保证制动期间速度环在工作
-    Speed_PID_StopBrake = 1;                                                // 禁止正向输出，避免 0 附近抖动
-
-    if (vmax < STOP_SPEED_EPS_CMS || stop_tick >= STOP_TICK_MAX)
-    {
-        Speed_PID_Enable    = 0;
-        Speed_PID_StopBrake = 0;
-        motor_stop();                                                       // 彻底断电
-
-        for (i = 0; i < WHEEL_NUM; i++)
-        {
-            Motor_PID[i].Target = 0.0f;
-            Motor_PID[i].Out    = 0.0f;
-            Motor_PID[i].OutCmd = 0.0f;
-        }
-
-        imu_set_bias_tracking(1);                                           // 停稳，重新开零偏跟踪
-        car_cmd   = 0;
-        car_state = CAR_IDLE;
-    }
-#else
-    if (car_state != CAR_STOP) return;
+    uint32 irq_state = interrupt_global_disable();
     Speed_PID_Enable = 0;
-    Speed_PID_StopBrake = 0;
-    launch_openloop = 0;
+    ramp_elapsed_ms = 0;
+    vision_omega_command = vision_vy_command = 0.0f;
+    for (i = 0; i < WHEEL_NUM; i++) PID_INC_Init(&Motor_PID[i]);
     motor_stop();
-    for (i = 0; i < WHEEL_NUM; i++)
-    {
-        Motor_PID[i].Target = 0.0f;
-        Motor_PID[i].Out = 0.0f;
-        Motor_PID[i].OutCmd = 0.0f;
-    }
     omega_dbg = 0.0f;
     speed_target_dbg = 0.0f;
     vy_dbg = 0.0f;
-    imu_set_bias_tracking(1);
+    stop_reason = reason;
+    stall_count = 0;
     car_cmd = 0;
     car_state = CAR_IDLE;
-#endif
+    interrupt_global_enable(irq_state);
+    imu_set_bias_tracking(1);
 }
 
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     转向环：偏差 → 自转角速度指令
 // 参数说明     err         赛道中线列坐标-画面中心（像素，>0 赛道在画面右侧）
 // 返回参数     自转角速度 ω（deg/s，>0 逆时针 / 车头向左）
-// 功能描述     ω = IMAGE_TURN_SIGN·(kp1·e + kp2·e·|e| + kd·Δe) - gyro_kd·gyro_z，再限幅
-// 备注信息     正常未镜像图像：err>0时应右转，omega<0；陀螺阻尼始终抵消当前旋转
+// 功能描述     只按新图像计算视觉P/二次P/D；陀螺阻尼与最终限幅由5ms任务完成。
+// 备注信息     正常未镜像图像：err>0时应右转，omega<0；不重复对旧图像更新D项。
 //-------------------------------------------------------------------------------------------------------------------
 static float omega_calc(float err)
 {
@@ -250,42 +177,9 @@ static float omega_calc(float err)
 
     omega = CONTROL_IMAGE_TURN_SIGN * (ctl_omega_kp1 * e
           + ctl_omega_kp2 * e * ((e >= 0.0f) ? e : -e)                      // 二次 P：大偏差强力纠偏
-          + ctl_omega_kd  * delta)
-          - ctl_gyro_kd   * gyro_z_dbg;                                     // 陀螺阻尼：抑制甩尾
-
-    if (omega >  ctl_omega_max) omega =  ctl_omega_max;
-    if (omega < -ctl_omega_max) omega = -ctl_omega_max;
+          + ctl_omega_kd  * delta);
 
     return omega;
-}
-
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     速度规划：偏差 → 前进速度目标
-// 功能描述     |err| 小于死区按直道速度跑；|err| 增大线性降到弯道速度
-//-------------------------------------------------------------------------------------------------------------------
-static float speed_plan(float err)
-{
-    float a;
-    float target;
-
-    a = (err >= 0.0f) ? err : -err;                                         // |err|
-
-    if (a <= CAR_SPEED_DEADBAND_CMS)
-    {
-        target = ctl_speed_straight;                                        // 直道
-    }
-    else if (a >= 50.0f)
-    {
-        target = ctl_speed_curve;                                           // 大弯
-    }
-    else
-    {
-        /* 中间线性过渡：4px→直道速度，50px→弯道速度 */
-        float t = (a - CAR_SPEED_DEADBAND_CMS) / (50.0f - CAR_SPEED_DEADBAND_CMS);
-        target = ctl_speed_straight + t * (ctl_speed_curve - ctl_speed_straight);
-    }
-
-    return target;
 }
 
 //-------------------------------------------------------------------------------------------------------------------
@@ -295,7 +189,7 @@ static float speed_plan(float err)
 //-------------------------------------------------------------------------------------------------------------------
 uint8 control_stall_watchdog(void)
 {
-#if ENCODER_ENABLE
+#if ENCODER_CLOSED_LOOP_ENABLE
     uint8 i;
     uint8 all_slow = 1;
     float v;
@@ -328,130 +222,66 @@ uint8 control_stall_watchdog(void)
 
     return 0;
 #else
-    /* 编码器未接时Actual恒为0，不能拿它判断堵转。 */
+    /* 闭环未开启时不使用轮速反馈判堵转；编码器硬件采样仍正常运行。 */
     stall_count = 0;
     return 0;
 #endif
 }
 
 //-------------------------------------------------------------------------------------------------------------------
-// 函数简介     外环主更新（50Hz，跟摄像头帧率走）
-// 功能描述     按状态推进：IDLE 静止 / LAUNCHING 开环起步 / RUNNING 循迹 / STOP 制动
-// 备注信息     本函数只产出四轮 Target，实际 PWM 由 200Hz 的 Speed_PID_Crtl() 下发
+// 函数简介     主循环每个新图像只更新视觉指令缓存；5ms任务负责四轮目标。
 //-------------------------------------------------------------------------------------------------------------------
 void control_update(void)
 {
-    float out[WHEEL_NUM];
-    float omega = 0.0f;
-    float vx    = 0.0f;
-    float vy    = 0.0f;
-    float rpm;
-    uint8 i;
-
-    gyro_z_dbg = imu_get_gyro_z_dps();
-
-    switch (car_state)
+    uint32 irq_state = interrupt_global_disable();
+    if (car_state != CAR_RUNNING)
     {
-        case CAR_IDLE:
-        {
-            for (i = 0; i < WHEEL_NUM; i++) Motor_PID[i].Target = 0.0f;
-            omega_dbg = 0.0f;
-            speed_target_dbg = 0.0f;
-            vy_dbg    = 0.0f;
-            break;
-        }
-
-        case CAR_LAUNCHING:
-        {
-            /* 开环阶段由 pid.c 直接给固定占空比，这里只判断何时切闭环：
-            * 两轮以上达到 CAR_LAUNCH_EXIT_CMS，或开环超时 */
-            rpm = (encoder_get_speed_cms(WHEEL_FL) + encoder_get_speed_cms(WHEEL_RR)) * 0.5f;
-
-            if (rpm >= CAR_LAUNCH_EXIT_CMS ||
-                launch_ol_tick >= (uint16)(CAR_LAUNCH_TIMEOUT_MS / SPEED_LOOP_PERIOD_MS))
-            {
-                launch_openloop        = 0;                                 // 退出开环
-                launch_transition_tick = 60;                                // 过渡保护 60×5ms = 0.3s
-                car_state              = CAR_RUNNING;
-
-                /* 闭环目标锁在退出速度附近，避免瞬间跳变 */
-                speed_filtered = rpm > CAR_LAUNCH_EXIT_CMS ? rpm : CAR_LAUNCH_EXIT_CMS;
-            }
-            else
-            {
-                speed_target_dbg = CAR_LAUNCH_EXIT_CMS;
-            }
-
-            omega_dbg = 0.0f;
-            break;
-        }
-
-        case CAR_RUNNING:
-        {
-            /* ---- 1. 转向环：err → ω ---- */
-            omega = omega_calc(g_vis.err);
-
-            /* ---- 2. 速度规划：err → vx，并做加速 LPF ---- */
-            {
-                float target = speed_plan(g_vis.err);
-                float alpha  = (target > speed_filtered) ? CAR_ACCEL_ALPHA_SLOW    // 加速：慢爬
-                                                        : 1.0f;                    // 减速：立即响应
-                speed_filtered += alpha * (target - speed_filtered);
-                vx = speed_filtered;
-            }
-
-            /* ---- 3. 横移（麦轮特有）：偏差的一部分映射为横向速度 ----
-            * err>0 赛道在画面右侧，应右移 → vy为负（默认横移增益仍为0） */
-            vy = CONTROL_IMAGE_TURN_SIGN * g_vis.err * ctl_lateral_gain;
-
-            /* ---- 4. 逆运动学：车体速度 → 四轮速度目标 ---- */
-            mecanum_inverse(vx, vy, omega, out);
-
-            for (i = 0; i < WHEEL_NUM; i++)
-            {
-                Motor_PID[i].Target = out[i];
-            }
-
-            omega_dbg        = omega;
-            speed_target_dbg = vx;
-            vy_dbg           = vy;
-            break;
-        }
-
-        case CAR_STOP:
-        {
-            control_stop_poll();
-            break;
-        }
-
-        default:
-            break;
+        vision_omega_command = vision_vy_command = 0.0f;
+        vision_err_abs = 0.0f;
+        interrupt_global_enable(irq_state);
+        return;
     }
+#if APP_VISION_TRACKING_ENABLE
+    vision_omega_command = omega_calc(g_vis.err);
+    vision_vy_command = CONTROL_IMAGE_TURN_SIGN * g_vis.err * ctl_lateral_gain;
+    vision_err_abs = (g_vis.err >= 0.0f) ? g_vis.err : -g_vis.err;           // 弯道降速用（5ms任务读取）
+#else
+    vision_omega_command = vision_vy_command = 0.0f;
+#endif
+    interrupt_global_enable(irq_state);
 }
 
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     遥测上行（VOFA+ Firewater 协议：逗号分隔 + 换行）
-// 功能描述     20 通道，只在主循环打印；沿用逐飞库printf重定向到UART1
-// 备注信息     默认每两帧约25Hz，115200；前4通道无编码器时为0占位，非测得轮速
-//-------------------------------------------------------------------------------------------------------------------
-void control_vofa_send(void)
+/* 固定5ms节拍：最新IMU→陀螺阻尼，起步时间→vx，再逆运动学分配四轮。
+ * 在RUNNING从第一拍就执行纠偏和PID；只限制前进目标，不直接设定PWM。
+ * 主循环暂无新图像时保持视觉指令缓存，但斜坡/陀螺反馈仍每拍更新。 */
+void control_tick_isr(void)
 {
-    printf(
-                "%.1f,%.1f,%.1f,%.1f,"      /* 1-4  四轮实际速度 cm/s   FL FR RL RR */
-                "%.1f,%.1f,%.1f,%.1f,"      /* 5-8  四轮目标速度 cm/s   FL FR RL RR */
-                "%.1f,%.1f,%.1f,%.1f,"      /* 9-12 四轮输出 duty        FL FR RL RR */
-                "%.1f,%.1f,%.1f,%.1f,"      /* 13-16 err / steer(ω) / gyro_z / 前进目标 */
-                "%u,%u,%u,%.1f\r\n",        /* 17-20 视觉耗时us / 状态 / 停车原因 / 横移 */
-                Motor_PID[WHEEL_FL].Actual, Motor_PID[WHEEL_FR].Actual,
-                Motor_PID[WHEEL_RL].Actual, Motor_PID[WHEEL_RR].Actual,
-                Motor_PID[WHEEL_FL].Target, Motor_PID[WHEEL_FR].Target,
-                Motor_PID[WHEEL_RL].Target, Motor_PID[WHEEL_RR].Target,
-                Motor_PID[WHEEL_FL].OutCmd, Motor_PID[WHEEL_FR].OutCmd,
-                Motor_PID[WHEEL_RL].OutCmd, Motor_PID[WHEEL_RR].OutCmd,
-                g_vis.err, omega_dbg, gyro_z_dbg, speed_target_dbg,
-                (unsigned int)vis_time_us,
-                (unsigned int)car_state,
-                (unsigned int)stop_reason,
-                vy_dbg);
-
+    uint8 i;
+    float out[WHEEL_NUM];
+    if (car_state != CAR_RUNNING || !Speed_PID_Enable) return;
+    if (ramp_elapsed_ms < CAR_START_RAMP_MS)
+    {
+        ramp_elapsed_ms += SPEED_LOOP_PERIOD_MS;
+        if (ramp_elapsed_ms > CAR_START_RAMP_MS) ramp_elapsed_ms = CAR_START_RAMP_MS;
+    }
+    /* 弯道降速：|e| 超过 ctl_corner_err_px 后按比例降低前进目标。
+     * 原理 R = v/ω：同样 240°/s 的转向权限，150cm/s 需要 36cm 半径，降到 82cm/s 只需 20cm。
+     * 关闭方法：config.h 的 CTL_CORNER_SLOW_RATIO_DEFAULT 设为 0。 */
+    {
+        float v_cruise = ctl_speed_target;
+        if (ctl_corner_slow > 0.0f && ctl_corner_err_px > 1.0f && vision_err_abs > ctl_corner_err_px)
+        {
+            float k = (vision_err_abs - ctl_corner_err_px) / ctl_corner_err_px;
+            if (k > 1.0f) k = 1.0f;
+            v_cruise *= (1.0f - ctl_corner_slow * k);
+        }
+        speed_target_dbg = v_cruise * ((float)ramp_elapsed_ms / (float)CAR_START_RAMP_MS);
+    }
+    gyro_z_dbg = imu_get_gyro_z_dps(); // 使用已实测安装符号-1，控制反馈左转正、右转负
+    omega_dbg = vision_omega_command - ctl_gyro_kd * gyro_z_dbg;
+    if (omega_dbg > ctl_omega_max) omega_dbg = ctl_omega_max;
+    if (omega_dbg < -ctl_omega_max) omega_dbg = -ctl_omega_max;
+    vy_dbg = vision_vy_command;
+    mecanum_inverse(speed_target_dbg, vy_dbg, omega_dbg, out);
+    for (i = 0; i < WHEEL_NUM; i++) Motor_PID[i].Target = out[i];
 }

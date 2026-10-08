@@ -15,15 +15,6 @@
 PID_INC_t Motor_PID[WHEEL_NUM];                                             // 四轮速度环，索引 wheel_index_enum
 
 volatile uint8 Speed_PID_Enable    = 0;                                     // 速度环总开关（发车后置 1）
-volatile uint8 Speed_PID_StopBrake = 0;                                     // 停车制动阶段：禁止正向输出，防 0 附近正反抖动
-
-/* ---- 起步开环（Round77 思路：低速段闭环容易卡顿，直接开环给固定占空比冲过去）---- */
-volatile uint8   launch_openloop          = 0;                              // 1=开环中
-volatile float   launch_ol_duty           = (float)CAR_LAUNCH_DUTY;         // 开环占空比
-volatile uint16  launch_ol_tick           = 0;                              // 开环已持续 tick 数（200Hz）
-volatile uint16  launch_transition_tick   = 0;                             // 切闭环后的过渡计时
-static   float   launch_transition_delta  = 8.0f;                          // 过渡期单次输出变化限幅
-
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     增量式 PID 结构初始化
 //-------------------------------------------------------------------------------------------------------------------
@@ -59,12 +50,6 @@ void PID_INC_Update(PID_INC_t *p)
           + p->Ki *  p->Error0
           + p->Kd * (p->Error0 - 2.0f * p->Error1 + p->Error2);
 
-    /* 过渡期限制单次输出变化，抑制切闭环瞬间的冲击 */
-    if (launch_transition_tick > 0)
-    {
-        if (delta >  launch_transition_delta) delta =  launch_transition_delta;
-        if (delta < -launch_transition_delta) delta = -launch_transition_delta;
-    }
     /* 打滑保护：单次增量限幅（OutDeltaMax>0 时生效） */
     if (p->OutDeltaMax > 0.0f)
     {
@@ -91,9 +76,6 @@ void PID_INC_Update(PID_INC_t *p)
 
     if (p->OutCmd >  (float)MOTOR_DUTY_MAX) p->OutCmd =  (float)MOTOR_DUTY_MAX;
     if (p->OutCmd < -(float)MOTOR_DUTY_MAX) p->OutCmd = -(float)MOTOR_DUTY_MAX;
-
-    /* 停车制动阶段：不允许正向输出，避免在 0 附近正反抖动 */
-    if (Speed_PID_StopBrake && p->OutCmd > 0.0f) p->OutCmd = 0.0f;
 
     p->Error2 = p->Error1;
     p->Error1 = p->Error0;
@@ -135,34 +117,36 @@ void Speed_PID_Sync_Params(void)
     Motor_PID[WHEEL_RR].Kff = SPEED_FF;
 }
 
+/* 遥测一次复制四轮目标/本拍实际/已下发PWM，防止读到混合的新旧内环数据。 */
+void Speed_PID_Snapshot(speed_pid_snapshot_t *out)
+{
+    uint8 i;
+    uint32 irq_state;
+    if (out == NULL) return;
+    irq_state = interrupt_global_disable();
+    for (i = 0; i < WHEEL_NUM; i++)
+    {
+        out->target[i] = Motor_PID[i].Target;
+        out->actual[i] = Motor_PID[i].Actual;
+        out->duty[i] = (float)(int16)Motor_PID[i].OutCmd;
+    }
+    interrupt_global_enable(irq_state);
+}
+
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     四轮速度环一次计算并下发 PWM（200Hz 中断调用）
 // 功能描述     1) 从编码器刷新四轮 Actual
-//              2) 开环阶段：直接给固定占空比，不计 PID
-//              3) 闭环阶段：四轮各自 PID → duty → motor_set_wheel
+//              2) 发车后四轮各自 PID → duty → motor_set_wheel
 //-------------------------------------------------------------------------------------------------------------------
 void Speed_PID_Crtl(void)
 {
     uint8 i;
-#if ENCODER_ENABLE
-    int16 duty;
+#if ENCODER_CLOSED_LOOP_ENABLE
 
     /* ---- 1. 刷新实际速度（cm/s）---- */
     for (i = 0; i < WHEEL_NUM; i++)
     {
         Motor_PID[i].Actual = encoder_get_speed_cms((wheel_index_enum)i);
-    }
-
-    if (launch_transition_tick > 0) launch_transition_tick--;
-
-    /* ---- 2. 起步开环：不做 PID，直接给固定占空比 ----
-    * 低速段闭环容易在 0 附近正反抖动/卡顿，开环冲过这个区间更干脆。 */
-    if (launch_openloop)
-    {
-        launch_ol_tick++;
-        duty = (int16)launch_ol_duty;
-        motor_set_wheels(duty, duty, duty, duty);
-        return;
     }
 
     /* ---- 3. 闭环 ---- */
@@ -178,12 +162,12 @@ void Speed_PID_Crtl(void)
         motor_set_wheel((wheel_index_enum)i, (int16)Motor_PID[i].OutCmd);
     }
 #else
-    /* 没有编码器时不积分、不执行速度PID；Actual=0仅表示反馈不可用。
+    /* 闭环未启用时不积分、不执行速度PID；Actual=0仅表示反馈不可用。
      * Target依然是运动学轮速指令，线性映射只用于临时验证方向和视觉纠偏。 */
     for (i = 0; i < WHEEL_NUM; i++)
     {
         float cmd = 0.0f;
-        if (Speed_PID_Enable && !Speed_PID_StopBrake)
+        if (Speed_PID_Enable)
         {
             cmd = Motor_PID[i].Target * MOTOR_OPEN_LOOP_GAIN;
             if (cmd >  MOTOR_OPEN_LOOP_MAX) cmd =  MOTOR_OPEN_LOOP_MAX;

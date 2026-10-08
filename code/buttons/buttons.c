@@ -1,76 +1,74 @@
-/*********************************************************************************************************************
-* 文件名称          buttons.c
-* 适用平台          RT1064DVL6A
-* 描述              主板四键的极简处理（发车 / 停车）
-*
-* 原工程（summer-smartcar）有一个 406 行的菜单系统，但那是绑在 IPS200 屏幕上的。
-* 本工程无屏，菜单整体移除，只保留"发车/停车"这两个现场必需的动作。
-* 其余参数全部走 config.h / control.c 的默认值 + WiFi 上传的数据来调。
-*********************************************************************************************************************/
-
+/* 现场按键：K1事件锁存后由主循环发车；K2在10ms扫描中断直接停车。
+ * 库短按事件只保留一拍，必须在扫描后立即存入pending_events。
+ * ISR不打印、不访问WiFi；状态日志仍由app主循环提交。 */
 #include "buttons.h"
 #include "config.h"
 #include "control.h"
 
-/* 最近一次按键动作（供调试/遥测读取） */
-static volatile uint8 last_action[KEY_NUMBER] = {0};
+#define BUTTON_EVENT_START (1u)
+#define BUTTON_EVENT_STOP  (2u)
+static volatile uint8 pending_events;
+static volatile uint16 stop_press_ms;
+static uint8 stop_press_handled;
+static const gpio_pin_enum button_pins[KEY_NUMBER] = KEY_LIST;
 
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     按键初始化
-// 备注信息     扫描本身由 100Hz 的 PIT_CH1 中断驱动（isr.c 调 key_scanner）
-//-------------------------------------------------------------------------------------------------------------------
 void buttons_init(void)
 {
+    pending_events = 0;
+    stop_press_ms = 0;
+    stop_press_handled = 0;
     key_init(KEY_SCAN_PERIOD_MS);
 }
 
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     主循环轮询：把按键动作翻译成车辆动作
-// 功能描述     KEY_1 发车（IDLE→LAUNCHING），KEY_2 停车（→STOP）
-// 备注信息     放在主循环而不是中断里：发车/停车会改多个状态变量，中断里做不安全
-//-------------------------------------------------------------------------------------------------------------------
-void buttons_poll(void)
+/* 10ms PIT：先保存库事件，再做K2按下消抖。普通按下连续20ms即清PWM，
+ * 不等待松手或主循环/WiFi。若短按不足20ms但被库识别，松手事件仍可停车。 */
+void buttons_scan_isr(void)
 {
-    key_state_enum ks;
-    uint8 i;
-
+    uint8 i, start = 0, stop = 0;
+    uint8 stop_down = (gpio_get_level(button_pins[KEY_2]) != KEY_RELEASE_LEVEL);
+    key_state_enum state;
+    key_scanner();
     for (i = 0; i < KEY_NUMBER; i++)
     {
-        ks = key_get_state((key_index_enum)i);
-        if (ks == KEY_RELEASE) continue;
-
-        key_clear_state((key_index_enum)i);                                // 消费掉这次动作
-        last_action[i] = (uint8)ks;
-
-        switch (i)
-        {
-            case KEY_1:                                                     // 发车
-                car_cmd = 1;
-                control_state_launch();
-                break;
-
-            case KEY_2:                                                     // 停车
-                car_cmd = 0;
-                control_state_stop(STOP_REASON_MANUAL);
-                break;
-
-            default:                                                        // KEY_3 / KEY_4 预留
-                break;
-        }
+        state = key_get_state((key_index_enum)i);
+        if (state == KEY_RELEASE) continue;
+        key_clear_state((key_index_enum)i);
+        if (i == KEY_1 && state == KEY_SHORT_PRESS) start = 1; // K1短按松开后发车
+        if (i == KEY_2 && !stop_press_handled) stop = 1;
     }
+    if (stop_down)
+    {
+        if (stop_press_ms < KEY_STOP_DEBOUNCE_MS) stop_press_ms += KEY_SCAN_PERIOD_MS;
+        if (stop_press_ms >= KEY_STOP_DEBOUNCE_MS && !stop_press_handled)
+        {
+            stop = 1;
+            stop_press_handled = 1;
+        }
+        start = 0; // 按住K2时丢弃K1，不允许重新开速度环
+        pending_events &= BUTTON_EVENT_STOP;
+    }
+    else
+    {
+        stop_press_ms = 0;
+        stop_press_handled = 0;
+    }
+    if (stop)
+    {
+        pending_events = BUTTON_EVENT_STOP; // 丢弃先前待处理K1，停车优先
+        control_state_stop(STOP_REASON_MANUAL); // 只清内存/目标/PWM，没有等待或通信
+    }
+    else if (start && !(pending_events & BUTTON_EVENT_STOP)) pending_events |= BUTTON_EVENT_START;
 }
 
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     读取某键最近一次动作（读后清除）
-// 返回参数     0=无 1=短按 2=长按
-//-------------------------------------------------------------------------------------------------------------------
-uint8 buttons_get_last_action(uint8 key_index)
+void buttons_poll(void)
 {
-    uint8 v;
-
-    if (key_index >= KEY_NUMBER) return 0;
-
-    v = last_action[key_index];
-    last_action[key_index] = 0;
-    return v;
+    uint8 events;
+    uint32 irq_state = interrupt_global_disable();
+    events = pending_events;
+    pending_events = 0;
+    /* 取事件与提交发车在同一临界区，防止K2刚停完、旧K1又开启PID。
+     * control_state_launch只复位内存/目标，不执行延时、SPI或网络通信。 */
+    if (events & BUTTON_EVENT_STOP) control_state_stop(STOP_REASON_MANUAL);
+    else if ((events & BUTTON_EVENT_START) && stop_press_ms == 0) control_state_launch();
+    interrupt_global_enable(irq_state);
 }

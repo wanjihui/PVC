@@ -2,17 +2,47 @@
 #include "vision.h"
 #include "config.h"
 
-/* 视觉层需要知道"是否处于起步阶段"，用来决定斑马线的确认帧数：
-* 起步时车速还在爬升，发车线斑马线可能只够 1 帧全有效，若仍按 2 帧确认会漏检。
-* （这是原 summer 工程里靠一个"什么都包含"的 config.h 隐式获得的依赖，移植到
-*   分模块布局后必须显式声明。加在 vision.h 之后，保证 VisionResult_t 已定义。）
-*
-* 分层说明：这是一处有意为之的反向依赖 —— 视觉层只读 car_state，不调用控制层函数。
-* 如需彻底解耦，可在 vision.h 里放一个 vision_set_launch_phase(uint8) 由 control.c 写入，
-* 但那样就偏离了原 vision.c 的逻辑，故保持现状并在此标注。 */
-#include "control.h"
 
 VisionResult_t g_vis;                        // 赛道识别结果（边界+中线+偏差）
+static uint8 vision_gray[pho_h][pho_w];      // 当前已消费帧，算法与上传共用，防止叠线错帧
+static uint8 vision_repair_flags[pho_h];
+static uint32 vision_previous_start;
+volatile uint32 vis_interval_us, vis_processed_frames, vis_last_event;
+
+uint8 vision_capture_frame(void)
+{
+    uint32 csi_enabled = NVIC_GetEnableIRQ(CSI_IRQn);
+    uint8 captured = 0;
+    NVIC_DisableIRQ(CSI_IRQn);
+    __DSB(); __ISB();
+    /* CSI回调不回收当前完成缓冲；短暂复制期间PIT采样/按键中断仍运行。 */
+    if (mt9v03x_finish_flag)
+    {
+        mt9v03x_finish_flag = 0;
+        memcpy(vision_gray, mt9v03x_image, sizeof(vision_gray));
+        captured = 1;
+    }
+    if (csi_enabled) NVIC_EnableIRQ(CSI_IRQn);
+    return captured;
+}
+
+void vision_monitor_payload(uint8 *destination)
+{
+    uint16 y;
+    memcpy(destination, vision_gray, sizeof(vision_gray));
+    destination += sizeof(vision_gray);
+    for (y = 0; y < pho_h; y++)
+    {
+        uint8 flags = vision_repair_flags[y];
+        uint8 l = g_vis.l_border[y], r = g_vis.r_border[y], c = g_vis.center_line[y];
+        if (l < pho_w && !g_vis.l_border_exist[y]) flags |= 1u;
+        if (r < pho_w && !g_vis.r_border_exist[y]) flags |= 2u;
+        *destination++ = l < pho_w ? l : BORDER_INVALID;
+        *destination++ = r < pho_w ? r : BORDER_INVALID;
+        *destination++ = c < pho_w ? c : BORDER_INVALID;
+        *destination++ = flags;
+    }
+}
 
 volatile uint8_t vis_frame_ready;          // 新帧处理完成（供上行传输层判断数据是否新鲜）
 volatile int16  asc_range_dbg = 0;          // 诊断：ASC窗口中心行（=clamp(asc_far,20,100)，随遥测上传）
@@ -177,7 +207,7 @@ static int compute_otsu(void)
     /* 全屏统计（行0~119），下采样4x4抗干扰 */
     for (int y = 0; y < pho_h; y += 4)
         for (int x = 0; x < pho_w; x += 4)
-            hist[mt9v03x_image[y][x]]++;
+            hist[vision_gray[y][x]]++;
 
     unsigned long total = (unsigned long)((pho_h + 3) / 4) * ((pho_w + 3) / 4);
     if (total == 0) return -1;
@@ -898,37 +928,7 @@ static int sweep_boundaries(void)
     return 0;
 }
 
-/* Round59: 自适应前瞻 —— 根据上一帧 err 动态调整预瞄中心行。
- * 直道看更远，弯道看更近；asc_far 仍作为菜单基准行。 */
-static uint8 calc_adaptive_far(void)
-{
-#if ADAPT_PREVIEW_ENABLE
-    /* Round68: 对 |err| 和目标前瞻行都做一阶低通，避免直道/小弯/大弯阈值
-     * 在 S 弯/连续弯里频繁跳变导致 err 来回摆、舵机微摆。 */
-    static float adapt_err_ema = -1.0f;
-    static float adapt_y_ema   = -1.0f;
 
-    float e_raw = (g_vis.err > 0.0f) ? g_vis.err : -g_vis.err;
-    if (adapt_err_ema < 0.0f) adapt_err_ema = e_raw;
-    adapt_err_ema += 0.35f * (e_raw - adapt_err_ema);
-
-    int y = (int)asc_far;
-    if      (adapt_err_ema <= ADAPT_ERR_TH1) y -= ADAPT_OFF_STR;   /* 直道看更远 */
-    else if (adapt_err_ema <= ADAPT_ERR_TH2) y += ADAPT_OFF_SML;   /* 小弯看近一点 */
-    else                                     y += ADAPT_OFF_BIG;   /* 大弯看更近 */
-    if (y < 20)  y = 20;
-    if (y > 100) y = 100;
-
-    if (adapt_y_ema < 0.0f) adapt_y_ema = (float)y;
-    adapt_y_ema += 0.35f * ((float)y - adapt_y_ema);
-    int ys = (int)(adapt_y_ema + 0.5f);
-    if (ys < 20)  ys = 20;
-    if (ys > 100) ys = 100;
-    return (uint8)ys;
-#else
-    return asc_far;
-#endif
-}
 
 static void pho_center(void)
 {
@@ -997,16 +997,9 @@ static void pho_center(void)
     // ---- 平滑中线（消除半宽偏移可能引入的不连续）----
     border_smooth(g_vis.center_line);
 
-    // ---- 窄窗口加权平均（自适应前瞻 ±10，远行强加权）----
-    /* ---- 动态前瞻（原 summer config.h 的 Adaptive preview 段，行为保持一致） ---- */
-#define ADAPT_PREVIEW_ENABLE   1
-#define ADAPT_ERR_TH1          10.0f    /* |err|<=TH1 视为直道 */
-#define ADAPT_ERR_TH2          20.0f    /* TH1<|err|<=TH2 视为小弯 */
-#define ADAPT_OFF_STR          5        /* 直道前瞻偏移 */
-#define ADAPT_OFF_SML          3        /* 小弯前瞻偏移 */
-#define ADAPT_OFF_BIG          5        /* 大弯前瞻偏移 */
+    // ---- 固定前瞻中心行 ±10，加权计算中线偏差 ----
 #define WINDOW_HALF 10
-    int y_center = (int)calc_adaptive_far();
+    int y_center = (int)asc_far;
     if (y_center < 20)  y_center = 20;
     if (y_center > 100) y_center = 100;
     int y_near = y_center + WINDOW_HALF;   // e.g. 50+10=60
@@ -1355,6 +1348,9 @@ static void cross_fill_segment(border_line line, uint8 exist[pho_h],
         int32 c = (int32)(k * (float)r + b);
         line[r]  = (uint8)cross_limit_u8(c, 0, MT9V03X_W - 1);
         exist[r] = 1;
+        /* 补线也会设置exist=1，所以独立保存补线来源，不能仅靠exist判断。 */
+        if (line == g_vis.l_border) vision_repair_flags[r] |= 1u;
+        if (line == g_vis.r_border) vision_repair_flags[r] |= 2u;
     }
 }
 
@@ -1814,12 +1810,7 @@ static void zebra_detect(void)
 
     if (aligned)
     {
-        /* 起步阶段（LAUNCHING，约前500ms）车速还在爬升，发车线斑马线
-         * 可能只够 1 帧全有效；若仍按 2 帧确认，第一圈发车线会漏检，
-         * 结果跑两圈才凑满 2 次上升沿。Round25 数据证实终点也只够 1 帧，
-         * 因此 LAUNCHING/RUNNING 都按 1 帧强确认。 */
-        uint8 confirm_need = (car_state == CAR_LAUNCHING)
-                           ? 1u : (uint8)ZEBRA_CONFIRM_FRAMES;
+        uint8 confirm_need = (uint8)ZEBRA_CONFIRM_FRAMES;
         if (zebra_confirm_count < confirm_need) zebra_confirm_count++;
         zebra_detected      = (zebra_confirm_count >= confirm_need);
         zebra_missed_count  = 0;
@@ -2028,12 +2019,18 @@ static int out_of_bounds_check(void)
 void vision_init(void)
 {
     timer_init(GPT_TIM_1, TIMER_US);                                        // 微秒计时，最大 0xFFFFFFFF
+    timer_start(GPT_TIM_1);                                               // 原库初始化后停止；显式启动才有真实耗时
     timer_clear(GPT_TIM_1);
+    vis_interval_us = vis_processed_frames = vis_last_event = 0;
+    vision_previous_start = 0;
 }
 
 VisionEvent vis_deal(void)
 {
     uint32 t_frame = timer_get(GPT_TIM_1);                                  // 本帧总耗时起点
+    vis_interval_us = vis_processed_frames ? t_frame - vision_previous_start : 0;
+    vision_previous_start = t_frame;
+    memset(vision_repair_flags, 0, sizeof(vision_repair_flags));
 
     /* ---- Otsu 自适应阈值（每10帧重算，EMA滤波抑制跳变；优化耗时）---- */
     static int cached_th = -1;
@@ -2057,7 +2054,7 @@ VisionEvent vis_deal(void)
     uint16 t_stage = timer_get(GPT_TIM_1);
     for (int y = 0; y < pho_h; y++)
         for (int x = 0; x < pho_w; x++)
-            Image_Used[y][x] = (mt9v03x_image[y][x] > th) ? 255 : 0;
+            Image_Used[y][x] = (vision_gray[y][x] > th) ? 255 : 0;
     vis_t_bin_us = (uint16)(timer_get(GPT_TIM_1) - t_stage);
 
     /* ---- 出界预检：必须在底部连通滤波之前，用原始二值图的
@@ -2121,6 +2118,8 @@ VisionEvent vis_deal(void)
     vis_frame_ready = 1;
     vis_export_trace();                                                     // 导出边界/中线坐标，供 WiFi 上传给上位机显示
     vis_time_us = timer_get(GPT_TIM_1) - t_frame;                           // 本帧总耗时(us)
+    vis_processed_frames++;
+    vis_last_event = (uint32)evt;
     return evt;
 }
 

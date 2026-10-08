@@ -1,129 +1,170 @@
-/*********************************************************************************************************************
-* 文件名称          imu.c
-* 适用平台          RT1064DVL6A
-* 描述              ICM20602 六轴传感器（硬件 SPI4）—— 只要陀螺仪 Z 轴
-*
-* 用途：
-*       1) 转向阻尼 / 自转闭环反馈（gyro_z，deg/s）
-*       2) 起步与停车的静止检测（判断车是否已经停稳）
-* 默认量程：陀螺仪 ±2000dps，加速度计 ±8g（由库的 ICM20602_*_SAMPLE_DEFAULT 决定）
-*********************************************************************************************************************/
-
+/* ICM20602统一采样：同一批六轴数据供姿态解算、控制反馈和上位机。 */
 #include "imu.h"
 #include "config.h"
+#include "imu_attitude.h"
+#if ICM20602_USE_SOFT_IIC
+#error "This board uses SPI4 ICM20602."
+#endif
+#if IMU_CAL_SAMPLES < 2 || IMU_PERIOD_MS < 1 || IMU_PERIOD_MS > 256
+#error "Invalid IMU calibration or sampling configuration."
+#endif
+#define IMU_DT ((float)IMU_PERIOD_MS / 1000.0f)
+#define IMU_HPF_COEF (IMU_DT / (0.8f + IMU_DT))
+#define IMU_GYRO_LPF_ALPHA 0.5f
+static volatile imu_snapshot_t imu_state;
+static float attitude_q[4], gyro_bias[3];
+static float gyro_z_bias, gyro_z_dps;
+static uint8 bias_tracking;
+static uint32 previous_cycles;
+static uint8 imu_read_register(uint8 reg)
+{
+    uint8 value;
+    ICM20602_CS(0);
+    value = spi_read_8bit_register(ICM20602_SPI, reg | ICM20602_SPI_R);
+    ICM20602_CS(1);
+    return value;
+}
 
-/* 采样时间常数：IMU_PERIOD_MS 由 config.h 给出（默认 5ms → 200Hz） */
-#define IMU_DT              ((float)IMU_PERIOD_MS / 1000.0f)
+static void imu_write_register(uint8 reg, uint8 value)
+{
+    ICM20602_CS(0);
+    spi_write_8bit_register(ICM20602_SPI, reg | ICM20602_SPI_W, value);
+    ICM20602_CS(1);
+}
 
-/* 零偏跟踪时间常数（秒）：静止时用慢速 EMA 跟踪零偏漂移
-* 1 阶高通等效：fc = 1/(2π·RC)。IMU_HPF_TAU_S 越大，零偏跟随越慢、越不容易被真实运动带偏 */
-#define IMU_HPF_TAU_S       (0.8f)
-
-/* 输出平滑：抑制量化噪声落到控制量上 */
-#define IMU_GYRO_LPF_ALPHA  (0.5f)                                          // 新值权重（200Hz 下等效约 40Hz 低通）
-
-static float gyro_z_bias   = 0.0f;                                          // 零偏（原始 LSB 单位）
-static float gyro_z_dps    = 0.0f;                                          // 平滑后的角速度输出
-static uint8 bias_tracking = 0;                                             // 静止零偏跟踪开关
-
-/* 零偏跟踪的单步系数：IMU_DT / (TAU + IMU_DT) */
-#define IMU_HPF_COEF        (IMU_DT / (IMU_HPF_TAU_S + IMU_DT))
-
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     ICM20602 初始化（含失败重试）
-// 返回参数     0=成功 1=失败
-// 使用示例     if(imu_init()) { /* 报错并停在屏幕上 */ }
-// 备注信息     与 E4_01_icm20602_demo 一致：失败时等待再重试，最多约 1 秒
-//-------------------------------------------------------------------------------------------------------------------
 uint8 imu_init(void)
 {
-    uint16 retry = 0;
+    uint16 sample;
+    uint8 axis, attempt, result = 1;
+    uint8 id, divider, filter;
+    float sum[3] = {0}, square_sum[3] = {0}, acc_sum[3] = {0};
+    float acc[3], std_dps[3], angles[3], norm;
+    imu_snapshot_t empty = {0};
 
-    while (icm20602_init())
+    imu_state = empty;
+    gyro_z_dps = 0;
+    bias_tracking = 0;
+    previous_cycles = 0;
+    for (attempt = 0; attempt < 3; attempt++)
     {
-        retry++;
-        if (retry > 10) return 1;                                           // 约 1 秒仍未成功 → 放弃
+        result = icm20602_init();
+        if (result == 0) break;
         system_delay_ms(100);
     }
+    if (result != 0) return 1;
 
-    imu_calibrate_gyro(200);                                                // 上电必须静止：采样 200 次求零偏
+    /* 库默认DIV=7对应125Hz。配置DIV=4对应200Hz，与5ms PIT一致。
+     * CONFIG=3选择约41Hz陀螺仪低通；加速度库默认约44.8Hz。只改运行时寄存器，不改库。 */
+    imu_write_register(ICM20602_CONFIG, 0x03);
+    imu_write_register(ICM20602_SMPLRT_DIV, (uint8)(IMU_PERIOD_MS - 1));
+    id = imu_read_register(ICM20602_WHO_AM_I);
+    divider = imu_read_register(ICM20602_SMPLRT_DIV);
+    filter = imu_read_register(ICM20602_CONFIG);
+    if (id != 0x12 || divider != IMU_PERIOD_MS - 1 || filter != 0x03) return 4;
+    system_delay_ms(100);                                                  // 等待传感器与低通输出稳定
+
+    for (sample = 0; sample < IMU_CAL_SAMPLES; sample++)
+    {
+        float raw[3];
+        icm20602_get_acc();
+        icm20602_get_gyro();
+        raw[0] = (float)icm20602_gyro_x;
+        raw[1] = (float)icm20602_gyro_y;
+        raw[2] = (float)icm20602_gyro_z;
+        acc_sum[0] += icm20602_acc_transition(icm20602_acc_x);
+        acc_sum[1] += icm20602_acc_transition(icm20602_acc_y);
+        acc_sum[2] += icm20602_acc_transition(icm20602_acc_z);
+        for (axis = 0; axis < 3; axis++)
+        {
+            sum[axis] += raw[axis];
+            square_sum[axis] += raw[axis] * raw[axis];
+        }
+        system_delay_ms(IMU_PERIOD_MS);
+    }
+    for (axis = 0; axis < 3; axis++)
+    {
+        float variance;
+        gyro_bias[axis] = sum[axis] / IMU_CAL_SAMPLES;
+        acc[axis] = acc_sum[axis] / IMU_CAL_SAMPLES;
+        variance = square_sum[axis] / IMU_CAL_SAMPLES - gyro_bias[axis] * gyro_bias[axis];
+        std_dps[axis] = icm20602_gyro_transition(sqrtf(variance > 0.0f ? variance : 0.0f));
+    }
+    norm = sqrtf(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
+    if (norm < 0.75f || norm > 1.25f) return 2;
+    /* 粗略运动筛查，不能替代人为保证静止（匀速旋转可能有很小的方差）。 */
+    if (std_dps[0] > 3.0f || std_dps[1] > 3.0f || std_dps[2] > 3.0f) return 3;
+
+    imu_attitude_reset(attitude_q, acc);
+    imu_attitude_angles(attitude_q, angles);
+    for (axis = 0; axis < 3; axis++)
+    {
+        imu_state.angles[axis] = angles[axis];
+        imu_state.acc_g[axis] = acc[axis];
+    }
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    imu_state.ready = 1;
+    gyro_z_bias = gyro_bias[2];
     return 0;
 }
 
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     陀螺仪零偏校准
-// 参数说明     samples     采样次数（每次间隔 IMU_PERIOD_MS）
-// 返回参数     实际采样次数
-// 功能描述     车必须静止，取平均作为零偏，同时把输出与滤波状态清零
-//-------------------------------------------------------------------------------------------------------------------
-uint16 imu_calibrate_gyro(uint16 samples)
-{
-    uint16 i;
-    float  sum = 0.0f;
-
-    if (samples == 0) return 0;
-
-    for (i = 0; i < samples; i++)
-    {
-        icm20602_get_gyro();
-        sum += (float)icm20602_gyro_z;
-        system_delay_ms(IMU_PERIOD_MS);
-    }
-
-    gyro_z_bias = sum / (float)samples;
-    gyro_z_dps  = 0.0f;
-    return samples;
-}
-
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     IMU 采样一次（200Hz 调用）
-// 功能描述     读原始值 → 去零偏 → 换算 deg/s → 零偏跟踪 → 输出平滑
-//-------------------------------------------------------------------------------------------------------------------
 void imu_update(void)
 {
-    float raw;
-    float dps;
+    uint32 started = DWT->CYCCNT;
+    uint32 cycles_per_us = system_clock / 1000000u;
+    uint32 interval = IMU_PERIOD_MS * 1000u;
+    uint32 cost;
+    uint8 axis;
+    float dt = IMU_DT;
+    float control_yaw_rate;
+    float acc[3], gyro[3], angles[3];
 
-    icm20602_get_gyro();                                                    // 刷新 icm20602_gyro_z
-
-    raw = (float)icm20602_gyro_z;
-    dps = (raw - gyro_z_bias) * 1.0f;
-    dps = icm20602_gyro_transition(dps);                                    // LSB → deg/s（用库的量程因子）
-
-    if (bias_tracking)
+    if (imu_state.sample_count != 0)
     {
-        /* 静止时的慢速零偏跟踪：等价于对原始值做 1 阶高通 */
-        gyro_z_bias += IMU_HPF_COEF * (raw - gyro_z_bias);
+        interval = (started - previous_cycles) / cycles_per_us;
+        if (interval > IMU_PERIOD_MS * 1500u) imu_state.late_samples++;
+        /* 正常抖动用实际dt；长时间缺采样无法重建运动，计数提示，不用陈旧角速度积分长间隔。 */
+        if (interval > 0 && interval <= IMU_PERIOD_MS * 10000u) dt = (float)interval * 0.000001f;
     }
-
-    dps *= IMU_MOUNT_YAW_SIGN;                                              // 安装方向归一：左转为正
-
-    gyro_z_dps += IMU_GYRO_LPF_ALPHA * (dps - gyro_z_dps);                   // 输出平滑
+    previous_cycles = started;
+    icm20602_get_acc();
+    icm20602_get_gyro();
+    imu_state.raw[0] = icm20602_acc_x;
+    imu_state.raw[1] = icm20602_acc_y;
+    imu_state.raw[2] = icm20602_acc_z;
+    imu_state.raw[3] = icm20602_gyro_x;
+    imu_state.raw[4] = icm20602_gyro_y;
+    imu_state.raw[5] = icm20602_gyro_z;
+    for (axis = 0; axis < 3; axis++)
+    {
+        acc[axis] = icm20602_acc_transition(imu_state.raw[axis]);
+        gyro[axis] = icm20602_gyro_transition((float)imu_state.raw[axis + 3] - gyro_bias[axis]);
+    }
+    /* 控制反馈沿用静止零偏跟踪；姿态和上位机六轴值沿用固定三轴校准，避免手动转车时吞掉航向。 */
+    control_yaw_rate = icm20602_gyro_transition((float)icm20602_gyro_z - gyro_z_bias);
+    if (bias_tracking) gyro_z_bias += IMU_HPF_COEF * ((float)icm20602_gyro_z - gyro_z_bias);
+    gyro_z_dps += IMU_GYRO_LPF_ALPHA * (control_yaw_rate * IMU_MOUNT_YAW_SIGN - gyro_z_dps);
+    imu_attitude_step(attitude_q, acc, gyro, dt, IMU_FUSION_KP);
+    imu_attitude_angles(attitude_q, angles);
+    for (axis = 0; axis < 3; axis++)
+    {
+        imu_state.angles[axis] = angles[axis];
+        imu_state.acc_g[axis] = acc[axis];
+        imu_state.gyro_dps[axis] = gyro[axis];
+    }
+    imu_state.interval_us = interval;
+    imu_state.sample_count++;
+    cost = (DWT->CYCCNT - started) / cycles_per_us;
+    if (cost > imu_state.max_update_us) imu_state.max_update_us = cost;
 }
 
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     读取陀螺仪 Z 轴角速度
-// 返回参数     deg/s，车头向左（逆时针）为正
-//-------------------------------------------------------------------------------------------------------------------
-float imu_get_gyro_z_dps(void)
+void imu_snapshot(imu_snapshot_t *snapshot)
 {
-    return gyro_z_dps;
+    uint32 primask;
+    zf_assert(snapshot != NULL);
+    primask = interrupt_global_disable();                                 // 仅复制快照，禁止在临界区打印或发WiFi
+    *snapshot = imu_state;
+    interrupt_global_enable(primask);
 }
-
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     三轴原始值（调试用）
-//-------------------------------------------------------------------------------------------------------------------
-int16 imu_get_gyro_raw_x(void) { return icm20602_gyro_x; }
-int16 imu_get_gyro_raw_y(void) { return icm20602_gyro_y; }
-int16 imu_get_gyro_raw_z(void) { return icm20602_gyro_z; }
-int16 imu_get_acc_raw_z (void) { return icm20602_acc_z;  }
-
-//-------------------------------------------------------------------------------------------------------------------
-// 函数简介     使能/禁止静止零偏跟踪
-// 参数说明     enable      1=跟踪（车停稳时调用）0=不跟踪（行驶中调用）
-// 备注信息     行驶中若继续跟踪，真实转向角速度会被当成零偏慢慢吃掉，必须关掉
-//-------------------------------------------------------------------------------------------------------------------
-void imu_set_bias_tracking(uint8 enable)
-{
-    bias_tracking = enable ? 1 : 0;
-}
+float imu_get_gyro_z_dps(void) { return gyro_z_dps; }
+void imu_set_bias_tracking(uint8 enable) { bias_tracking = enable ? 1 : 0; }

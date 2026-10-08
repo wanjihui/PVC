@@ -41,15 +41,13 @@ typedef struct
 extern PID_INC_t Motor_PID[WHEEL_NUM];                                      // 四轮速度环，索引用 wheel_index_enum
 
 extern volatile uint8 Speed_PID_Enable;                                     // 速度环总开关
-extern volatile uint8 Speed_PID_StopBrake;                                  // 停车制动阶段标志
-
-/* 起步开环状态：pid.c 拥有并在 200Hz 内环里推进，control.c 在 50Hz 外环里读取
-* （control.c 判断"何时切闭环"，pid.c 判断"这一拍该开环还是跑 PID"） */
-extern volatile uint8   launch_openloop;                                    // 1=开环中，直接给固定占空比
-extern volatile float   launch_ol_duty;                                     // 开环占空比
-extern volatile uint16  launch_ol_tick;                                     // 开环已持续 tick 数（200Hz）
-extern volatile uint16  launch_transition_tick;                             // 切闭环后的过渡保护计时
-
+typedef struct
+{
+    float target[WHEEL_NUM];
+    float actual[WHEEL_NUM];
+    float duty[WHEEL_NUM]; // 实际提交给motor_set_wheel的整数百分比，按逻辑前进方向表示
+} speed_pid_snapshot_t;
+void Speed_PID_Snapshot(speed_pid_snapshot_t *out); // 主循环短临界区复制，网络发送不进入临界区
 void PID_INC_Init(PID_INC_t *p);
 void PID_INC_Update(PID_INC_t *p);
 

@@ -1,41 +1,22 @@
-/*********************************************************************************************************************
-* 文件名称          wifi.h
-* 适用平台          RT1064DVL6A
-* 描述              高速 WiFi SPI 模块 —— 图像上传 + 示波器数据上传（逐飞助手）
-
-* 用途：本工程无屏，调参完全依赖"把图像和边界/中线传到电脑上的逐飞助手看"。
-*
-* 占用的引脚（由 libraries/zf_device/zf_device_wifi_spi.h 固定）：
-*       SCK  = D12        MOSI = D14        MISO = D15
-*       CS   = D13        INT  = B17        RST  = B16
-*   ⚠ 这 6 个引脚与 IPS200 并口屏的 D0~D6 完全重叠，所以本工程**不能接屏幕**。
-*
-* 上传节拍（重要，避免拖慢控制）：
-*       图像   每 WIFI_IMG_SEND_DIV 帧一次（默认 25 → 约 2Hz），单帧 188*120 传输耗时百毫秒级
-*       示波器 每 WIFI_DATA_SEND_DIV 帧一次（默认 5 → 约 10Hz），单帧仅几十字节
-*   两者都在**主循环**里发送，不在 200Hz 中断里，所以**速度环不受影响**；
-*   代价只是发送期间视觉帧率下降——这是无线传图的固有代价。
-*********************************************************************************************************************/
-
-#ifndef __WIFI_H_
-#define __WIFI_H_
-
+#ifndef MCAR_WIFI_H
+#define MCAR_WIFI_H
 #include "zf_common_headfile.h"
-
-/* 初始化：连接 WiFi、建立 TCP 连接、初始化逐飞助手接口
-* 返回 0=成功，1=失败（失败不阻塞主流程，只是没有无线数据） */
+#include "config.h"
+/* 0成功；1模块/SPI失败，2入网失败，3UDP配置失败，4凭据异常，5异步DMA配置异常。 */
 uint8 wifi_init(void);
-
-/* 主循环轮询：按降频节拍上传图像与示波器数据（内部自动计数，直接每帧调用即可） */
-void wifi_poll(void);
-
-/* 立即上传一次当前视觉结果（灰度图 + 左边界/中线/右边界），用于手动抓图 */
-void wifi_send_image_now(void);
-
-/* 立即上传一次示波器数据（8 通道） */
-void wifi_send_scope_now(void);
-
-/* 查询 TCP 连接状态：1=已连接 0=未连接 */
-uint8 wifi_is_connected(void);
-
+void wifi_poll(uint32 now_ms, uint8 new_camera_frame); // 新图像与参数包独立上传；停车仍有IMU，目标/PWM归零
+#if APP_IMU_VERIFY_ENABLE
+/* IMU 符号验证模式专用：按 WIFI_DATA_PERIOD_MS 提交只含 IMU 的参数包，不依赖 car_state。
+ * 参数包仍是 148 字节，前 36 字节与正常模式布局一致，上位机用同一解析器。 */
+void wifi_poll_imu_verify(uint32 now_ms);
+#endif
+void wifi_cancel_camera(void); // 显式禁用摄像头才取消半帧，K1/K2不取消图像
+void wifi_cancel_data(void);   // 显式停用通信才取消参数；K2不取消IMU
+void wifi_record_service_cost(uint32 elapsed_us); // 主循环上一轮WiFi服务耗时/上电以来峰值
+/* 无论停车/运行都调用：推进异步发送，包括参数/图像，停车也有IMU参数、图像和必要日志。 */
+void wifi_poll_log(uint32 now_ms);
+/* 主循环事件日志同时输出UART和8KB待发缓存；不得在中断调用。 */
+int wifi_log(const char *format, ...);
+uint8 wifi_flush_log(void);
+/* wifi_flush_log返回0表示请求已接受；主循环继续poll才真正提交，不同步等待。 */
 #endif

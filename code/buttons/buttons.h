@@ -14,8 +14,8 @@
 *       KEY_3 (C13)  预留（当前不处理）
 *       KEY_4 (C12)  预留（当前不处理）
 *
-* 扫描节拍：100Hz，在 PIT_CH1 中断里由 isr.c 调用 key_scanner()；
-*          本模块的 buttons_poll() 在主循环里读取扫描结果并执行动作。
+* 扫描节拍：100Hz，PIT_CH1调用buttons_scan_isr保存事件；K2直接清PWM。
+*          buttons_poll在主循环消费锁存事件，K1在主循环发车。
 *********************************************************************************************************************/
 
 #ifndef __BUTTONS_H_
@@ -25,11 +25,10 @@
 
 /* 初始化（初始化四键，扫描周期取 config.h 的 KEY_SCAN_PERIOD_MS） */
 void buttons_init(void);
+/* 10ms中断扫描并锁存事件；K2直接停车，不等待WiFi主循环。 */
+void buttons_scan_isr(void);
 
-/* 主循环轮询：处理发车/停车动作（必须在主循环调用，不要在中断里调用） */
+/* 主循环消费锁存事件：K1短按发车、确认K2停车；日志留在app主循环 */
 void buttons_poll(void);
-
-/* 调试用：读取某键最近一次动作，0=无 1=短按 2=长按（读后清除） */
-uint8 buttons_get_last_action(uint8 key_index);
 
 #endif
