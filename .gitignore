@@ -32,3 +32,4 @@ Thumbs.db
 # libraries 中的 .a / .lib 为工程依赖，应保留
 tests/native_framework/
 tests/native_qtimer/
+/docs/项目进展总结_*.md
