@@ -17,6 +17,7 @@
 #define VISION_H
 
 #include "zf_common_headfile.h"
+#include "config.h"
 
 /* ========== 图像尺寸 ========== */
 #define pho_h                   MT9V03X_H                                   // 120 行
@@ -27,7 +28,7 @@
 #define BORDER_INVALID          (255)                                       // 边界无效标记（不与 0~187 合法列号冲突）
 
 /* ========== 可调视觉参数（上车标定入口） ========== */
-#define VIS_PREVIEW_ROW_DEFAULT (55)                                        // 前瞻基准行 asc_far 默认值
+#define VIS_PREVIEW_ROW_DEFAULT CTL_PREVIEW_ROW_DEFAULT                                        // 前瞻基准行 asc_far 默认值
 #define VIS_SWEEP_OFFSET        (8 )                                        // 边界跟随起点向内偏移
 #define VIS_FILTER_BOTTOM_ROWS  (110)                                       // 底部连通滤波处理行数（越大越慢）
 #define VIS_OTSU_INTERVAL       (10)                                        // 大津法每 N 帧重算一次
@@ -66,9 +67,12 @@ typedef struct
 extern VisionResult_t g_vis;
 
 /* 同一帧快照用于算法和上传；仅主循环调用，不在采集中断里处理图像。
- * 上传布局：原始灰度 w*h 字节 + 每行4字节[left,right,center,repair_flags]。
- * flags bit0/bit1分别表示左右补线，255表示无效列。 */
-#define VISION_MONITOR_SIZE (MT9V03X_IMAGE_SIZE + 4u * pho_h)
+ * MCAM format=3：原始灰度w*h + 每行4字节[left,right,center,repair_flags] + 12字节标注。
+ * 标注：[取值远行,取值近行,拐点有效mask,拐点状态,左上x/y,右上x/y,左下x/y,右下x/y]。
+ * repair_flags bit0/1表示左右补线；mask bit0..3对应四拐点；255表示无效坐标。
+ * 拐点状态：0无、1候选、2确认、3短暂保持；坐标来自本帧实际识别/保持结果。 */
+#define VISION_MONITOR_METADATA_SIZE 12u
+#define VISION_MONITOR_SIZE (MT9V03X_IMAGE_SIZE + 4u * pho_h + VISION_MONITOR_METADATA_SIZE)
 uint8 vision_capture_frame(void);
 void vision_monitor_payload(uint8 *destination);
 extern volatile uint32 vis_interval_us, vis_processed_frames;

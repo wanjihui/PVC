@@ -107,6 +107,12 @@ void app_init(void)
              (unsigned int)drive_allowed, (unsigned int)ENCODER_CLOSED_LOOP_ENABLE,
              (unsigned int)APP_VISION_TRACKING_ENABLE, (double)CAR_TARGET_SPEED_CMS,
              (unsigned long)CAR_START_RAMP_MS, (double)ctl_gyro_kd);
+#if APP_VISION_TRACKING_ENABLE && CTL_CURVE_SPEED_ENABLE
+    wifi_log("[READY] CURVE straight=%.0f normal=%.0f tight=%.0f cm/s; demand=%.0f/%.0f dps; decel=%.0f accel=%.0f cm/s2\r\n",
+             (double)CAR_TARGET_SPEED_CMS,(double)CTL_CURVE_NORMAL_CMS,(double)CTL_CURVE_TIGHT_CMS,
+             (double)CTL_CURVE_ENTER_DPS,(double)CTL_CURVE_TIGHT_DPS,
+             (double)CTL_CURVE_DECEL_CMS2,(double)CTL_CURVE_ACCEL_CMS2);
+#endif
     // 连通后请求启动日志补发，不需要K1；接下来的主循环分步推进，失败缓存保留。
     if (network_ready) (void)wifi_flush_log();
 }
@@ -125,7 +131,7 @@ static void app_buttons_poll(void)
         zebra_rises = 0;
 #endif
         wifi_log("[RUN] START target=%.1fcm/s vision=%u ms=%lu\r\n",
-                 (double)CAR_TARGET_SPEED_CMS, (unsigned int)APP_VISION_TRACKING_ENABLE,
+                 (double)ctl_speed_target, (unsigned int)APP_VISION_TRACKING_ENABLE,
                  (unsigned long)elapsed_ms);
     }
     else if (previous == CAR_RUNNING && car_state == CAR_IDLE)
@@ -203,23 +209,11 @@ void app_poll(void)
     if (network_ready) wifi_poll(elapsed_ms, new_frame);
     else { wifi_cancel_data(); wifi_cancel_camera(); }
     if (network_ready) wifi_poll_log(elapsed_ms); // 停车仍可推进图像和必要日志
-#if (WIFI_CAMERA_DRAIN_STEPS > 1u)
-    /* 有界补发：把"一圈一片"放宽到"一圈最多 N 片"，缩短整帧上传所需轮数。
-     * 约束：① 时间预算 WIFI_CAMERA_DRAIN_US；② 本轮有新图像时不补发，视觉外环优先。 */
-    if (network_ready && !new_frame)
+    if (network_ready && !wifi_is_ready())
     {
-        uint32 drain_start = timer_get(GPT_TIM_1);
-        uint8  drain_step;
-        for (drain_step = 1u; drain_step < (uint8)WIFI_CAMERA_DRAIN_STEPS; drain_step++)
-        {
-            if ((uint32)(timer_get(GPT_TIM_1) - drain_start) >= (uint32)WIFI_CAMERA_DRAIN_US)
-            {
-                break;
-            }
-            wifi_poll_log(elapsed_ms);
-        }
+        network_ready = 0;
+        network_retry_at = elapsed_ms; // 故障后5秒，且仅停车允许同步入网
     }
-#endif
 #if APP_VISION_TRACKING_ENABLE
     if (network_ready) wifi_record_service_cost(timer_get(GPT_TIM_1) - wifi_start);
 #endif
@@ -309,6 +303,7 @@ void app_poll(void)
     {
         wifi_poll_imu_verify(verify_ms); // 148字节兼容包，无编码器/PID/视觉调用
         wifi_poll_log(verify_ms);        // 初始化日志和IMU数据都由异步WiFi状态机发送
+        if (!wifi_is_ready()) { verify_network_ready = 0; verify_retry_ms = verify_ms; }
         wifi_record_service_cost(timer_get(GPT_TIM_1) - wifi_start);
     }
     system_delay_ms(1);

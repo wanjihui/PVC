@@ -69,6 +69,7 @@ void encoder_get_all_cms(float out[WHEEL_NUM]);
 #define APP_IMU_VERIFY_TEXT_LOG_HZ 0
 #endif
 #define WIFI_DATA_PERIOD_MS 50u
+#define APP_MAIN_LOOP_DELAY_MS 1u
 extern float ctl_gyro_kd;
 #define SYSTEM_CLOCK_600M 600
 #define SPEED_LOOP_PERIOD_MS 5
@@ -90,6 +91,7 @@ void key_init(uint32);
 #define STOP_REASON_LOST 2
 #define STOP_REASON_MANUAL 3
 extern volatile CarState car_state;
+extern float ctl_speed_target;
 extern volatile uint8 stop_reason, mt9v03x_finish_flag;
 extern char wifi_spi_ip_addr_port[];
 void clock_init(int);
@@ -118,6 +120,7 @@ void buttons_init(void);
 void buttons_scan_isr(void);
 void pit_ms_init(int, int);
 uint8 wifi_init(void);
+uint8 wifi_is_ready(void);
 uint8 wifi_flush_log(void);
 void encoder_pit_callback(void);
 void imu_update(void);

@@ -40,6 +40,7 @@ typedef struct
 /**********************************************************/
 extern PID_INC_t Motor_PID[WHEEL_NUM];                                      // 四轮速度环，索引用 wheel_index_enum
 
+extern float speed_kp[WHEEL_NUM], speed_ki[WHEEL_NUM], speed_kd[WHEEL_NUM], speed_ff;
 extern volatile uint8 Speed_PID_Enable;                                     // 速度环总开关
 typedef struct
 {

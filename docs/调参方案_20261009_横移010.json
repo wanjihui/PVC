@@ -1,0 +1,28 @@
+{
+  "format": "MCAR_TUNING_1",
+  "values": {
+    "cruise_cms": 150.0,
+    "ramp_ms": 500,
+    "preview_row": 55,
+    "deadband_px": 2.0,
+    "omega_kp1": 1.6,
+    "omega_kp2": 0.012,
+    "omega_kd": 0.3,
+    "omega_max_dps": 240.0,
+    "gyro_kd": 0.3,
+    "lateral_gain": 0.1,
+    "kp_FL": 0.2,
+    "ki_FL": 0.001,
+    "kd_FL": 0.0,
+    "kp_FR": 0.2,
+    "ki_FR": 0.001,
+    "kd_FR": 0.0,
+    "kp_RL": 0.18,
+    "ki_RL": 0.001,
+    "kd_RL": 0.0,
+    "kp_RR": 0.18,
+    "ki_RR": 0.001,
+    "kd_RR": 0.0,
+    "ff": 0.0
+  }
+}

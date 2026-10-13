@@ -14,6 +14,11 @@
 
 PID_INC_t Motor_PID[WHEEL_NUM];                                             // 四轮速度环，索引 wheel_index_enum
 
+float speed_kp[WHEEL_NUM] = {SPEED_KP_FL,SPEED_KP_FR,SPEED_KP_RL,SPEED_KP_RR};
+float speed_ki[WHEEL_NUM] = {SPEED_KI_FL,SPEED_KI_FR,SPEED_KI_RL,SPEED_KI_RR};
+float speed_kd[WHEEL_NUM] = {SPEED_KD_FL,SPEED_KD_FR,SPEED_KD_RL,SPEED_KD_RR};
+float speed_ff = SPEED_FF; // 在线更改保持积分，不复位电机输出
+
 volatile uint8 Speed_PID_Enable    = 0;                                     // 速度环总开关（发车后置 1）
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     增量式 PID 结构初始化
@@ -35,7 +40,7 @@ void PID_INC_Init(PID_INC_t *p)
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     增量式 PID 单步计算
 // 功能描述     Δu = Kp·(e0-e1) + Ki·e0 + Kd·(e0-2e1+e2)
-//              输出累加后限幅；Target>Actual（要加速）时叠加速度前馈，刹车时不叠加
+//              输出累加后限幅；Target>Actual（要加速）时叠加正误差附加项，负误差时不叠加
 //-------------------------------------------------------------------------------------------------------------------
 void PID_INC_Update(PID_INC_t *p)
 {
@@ -64,7 +69,7 @@ void PID_INC_Update(PID_INC_t *p)
 
     p->Out = out;
 
-    /* 速度前馈：只在需要加速时叠加（刹车/减速靠反馈），Round72 教训：FF 过大会饱和 */
+    /* 正误差附加项：Kff*(Target-Actual)，不按目标速度单独计算前馈；默认关闭 */
     if (p->Target > p->Actual)
     {
         p->OutCmd = p->Out + p->Kff * (p->Target - p->Actual);
@@ -83,7 +88,7 @@ void PID_INC_Update(PID_INC_t *p)
 
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     四轮速度环初始化
-// 功能描述     清零中间量并载入 config.h 的 Kp/Ki/Kd/Kff 与输出限幅
+// 功能描述     清零中间量并载入当前运行参数与输出限幅
 //-------------------------------------------------------------------------------------------------------------------
 void Speed_PID_Init(void)
 {
@@ -106,15 +111,14 @@ void Speed_PID_Init(void)
 //-------------------------------------------------------------------------------------------------------------------
 void Speed_PID_Sync_Params(void)
 {
-    Motor_PID[WHEEL_FL].Kp = SPEED_KP_FL;  Motor_PID[WHEEL_FL].Ki = SPEED_KI_FL;  Motor_PID[WHEEL_FL].Kd = SPEED_KD_FL;
-    Motor_PID[WHEEL_FR].Kp = SPEED_KP_FR;  Motor_PID[WHEEL_FR].Ki = SPEED_KI_FR;  Motor_PID[WHEEL_FR].Kd = SPEED_KD_FR;
-    Motor_PID[WHEEL_RL].Kp = SPEED_KP_RL;  Motor_PID[WHEEL_RL].Ki = SPEED_KI_RL;  Motor_PID[WHEEL_RL].Kd = SPEED_KD_RL;
-    Motor_PID[WHEEL_RR].Kp = SPEED_KP_RR;  Motor_PID[WHEEL_RR].Ki = SPEED_KI_RR;  Motor_PID[WHEEL_RR].Kd = SPEED_KD_RR;
-
-    Motor_PID[WHEEL_FL].Kff = SPEED_FF;
-    Motor_PID[WHEEL_FR].Kff = SPEED_FF;
-    Motor_PID[WHEEL_RL].Kff = SPEED_FF;
-    Motor_PID[WHEEL_RR].Kff = SPEED_FF;
+    uint8 i;
+    for (i = 0; i < WHEEL_NUM; i++)
+    {
+        Motor_PID[i].Kp = speed_kp[i];
+        Motor_PID[i].Ki = speed_ki[i];
+        Motor_PID[i].Kd = speed_kd[i];
+        Motor_PID[i].Kff = speed_ff;
+    }
 }
 
 /* 遥测一次复制四轮目标/本拍实际/已下发PWM，防止读到混合的新旧内环数据。 */

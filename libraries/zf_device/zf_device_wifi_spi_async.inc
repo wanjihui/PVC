@@ -8,7 +8,7 @@
 #include "fsl_dmamux.h"
 #include "zf_common_interrupt.h"
 
-#define WIFI_ASYNC_MAX_PACKET       1424u
+#define WIFI_ASYNC_MAX_PACKET       1432u // 原1424字节MCAM分片加8字节MUDP；UDP/IP后仍小于1500字节
 #define WIFI_ASYNC_PHASE_TIMEOUT_MS 200u
 #define WIFI_ASYNC_TOTAL_TIMEOUT_MS 500u
 #define WIFI_ASYNC_AUTO_SEND_US     3000u // Module auto-sends after 2ms; reserve a 1ms margin
@@ -29,7 +29,7 @@ typedef enum
     WIFI_ASYNC_CLOSE_SEND, WIFI_ASYNC_CLOSE_REPLY,
     WIFI_ASYNC_CONNECT_SEND, WIFI_ASYNC_CONNECT_REPLY,
     WIFI_ASYNC_DATA_SEND, WIFI_ASYNC_DATA_DRAIN,
-    WIFI_ASYNC_AUTO_SEND_WAIT
+    WIFI_ASYNC_AUTO_SEND_WAIT, WIFI_ASYNC_RX_POLL
 } wifi_async_phase_enum;
 
 static uint8 wifi_async_enabled, wifi_async_dma_ready, wifi_async_active;
@@ -115,6 +115,11 @@ void wifi_spi_send_cancel(void)
 {
     if (wifi_async_active) wifi_async_finish(WIFI_SPI_ASYNC_CANCELLED);
 }
+void wifi_spi_refresh_socket(void)
+{
+    if (wifi_async_active) wifi_async_finish(WIFI_SPI_ASYNC_CANCELLED);
+    wifi_async_dirty = 1;
+}
 
 uint8 wifi_spi_send_async(const uint8 *buffer, uint16 length, const char *port, uint32 now_ms)
 {
@@ -131,6 +136,26 @@ uint8 wifi_spi_send_async(const uint8 *buffer, uint16 length, const char *port, 
     wifi_async_result = WIFI_SPI_ASYNC_BUSY;
     wifi_spi_mutex = WIFI_SPI_BUSY;
     return 0;
+}
+
+/* Nonblocking read-only transfer; outgoing UDP auto-send windows have already finished. */
+uint8 wifi_spi_receive_async(uint32 now_ms)
+{
+    if (!wifi_async_enabled || wifi_spi_is_busy()) return 1;
+    wifi_async_phase = WIFI_ASYNC_RX_POLL;
+    wifi_async_started = wifi_async_phase_at = now_ms;
+    wifi_async_active = 1;
+    wifi_async_result = WIFI_SPI_ASYNC_BUSY;
+    wifi_spi_mutex = WIFI_SPI_BUSY;
+    return 0;
+}
+/* Only consume the software FIFO; never invoke the original synchronous SPI reader. */
+uint32 wifi_spi_read_async_fifo(uint8 *buffer, uint32 capacity)
+{
+    uint32 length = fifo_used(&wifi_spi_fifo);
+    if (length > capacity) length = capacity;
+    if (length) fifo_read_buffer(&wifi_spi_fifo,buffer,&length,FIFO_READ_AND_CLEAN);
+    return length;
 }
 
 /* A ready INT starts one DMA transfer. Its header/payload are sent in one
@@ -166,6 +191,7 @@ static uint8 wifi_async_start_dma(void)
             break;
         case WIFI_ASYNC_CLOSE_REPLY:
         case WIFI_ASYNC_DATA_DRAIN:
+        case WIFI_ASYNC_RX_POLL:
             wifi_async_clock_bytes += WIFI_SPI_RECVIVE_SIZE;
             break;
         default: break; // Socket acknowledgement is a 4-byte header
@@ -229,7 +255,7 @@ void wifi_spi_send_poll(uint32 now_ms)
     /* Only data-bearing exchanges may carry a module RX payload. A malformed
      * length must never read beyond the received DMA buffer/FIFO packet size. */
     if ((wifi_async_phase == WIFI_ASYNC_DATA_SEND || wifi_async_phase == WIFI_ASYNC_DATA_DRAIN ||
-         wifi_async_phase == WIFI_ASYNC_CLOSE_REPLY) &&
+         wifi_async_phase == WIFI_ASYNC_CLOSE_REPLY || wifi_async_phase == WIFI_ASYNC_RX_POLL) &&
         (reply->command == WIFI_SPI_REPLY_DATA_START || reply->command == WIFI_SPI_REPLY_DATA_END))
     {
         if (reply->length > WIFI_SPI_RECVIVE_SIZE || reply->length > wifi_async_clock_bytes - 4u)
@@ -264,6 +290,13 @@ void wifi_spi_send_poll(uint32 now_ms)
             else if (reply->command != WIFI_SPI_REPLY_DATA_START)
             { wifi_async_finish(WIFI_SPI_ASYNC_PROTOCOL); return; }
             break;
+        case WIFI_ASYNC_RX_POLL:
+            if (reply->command == WIFI_SPI_REPLY_DATA_START) break;
+            if (reply->command != WIFI_SPI_REPLY_OK && reply->command != WIFI_SPI_REPLY_DATA_END &&
+                reply->command != WIFI_SPI_INVALID1 && reply->command != WIFI_SPI_INVALID2)
+            { wifi_async_finish(WIFI_SPI_ASYNC_PROTOCOL); return; }
+            wifi_async_finish(WIFI_SPI_ASYNC_OK);
+            return;
         case WIFI_ASYNC_AUTO_SEND_WAIT: break; // Already handled above.
     }
     /* DATA_START drain repeats are bounded by the original phase deadline. */

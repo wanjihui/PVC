@@ -6,6 +6,10 @@
 VisionResult_t g_vis;                        // 赛道识别结果（边界+中线+偏差）
 static uint8 vision_gray[pho_h][pho_w];      // 当前已消费帧，算法与上传共用，防止叠线错帧
 static uint8 vision_repair_flags[pho_h];
+static uint8 vision_sample_far = VIS_PREVIEW_ROW_DEFAULT - 10u;
+static uint8 vision_sample_near = VIS_PREVIEW_ROW_DEFAULT + 10u;
+static uint8 vision_corners_in_frame;
+static void vision_monitor_metadata(uint8 *destination);
 static uint32 vision_previous_start;
 volatile uint32 vis_interval_us, vis_processed_frames, vis_last_event;
 
@@ -35,13 +39,15 @@ void vision_monitor_payload(uint8 *destination)
     {
         uint8 flags = vision_repair_flags[y];
         uint8 l = g_vis.l_border[y], r = g_vis.r_border[y], c = g_vis.center_line[y];
-        if (l < pho_w && !g_vis.l_border_exist[y]) flags |= 1u;
-        if (r < pho_w && !g_vis.r_border_exist[y]) flags |= 2u;
+        /* 普通单边丢失的内部搜索外推不属于十字补线，不显示虚构的紫色边界。 */
+        if (!g_vis.l_border_exist[y] && !(flags & 1u)) l = BORDER_INVALID;
+        if (!g_vis.r_border_exist[y] && !(flags & 2u)) r = BORDER_INVALID;
         *destination++ = l < pho_w ? l : BORDER_INVALID;
         *destination++ = r < pho_w ? r : BORDER_INVALID;
         *destination++ = c < pho_w ? c : BORDER_INVALID;
         *destination++ = flags;
     }
+    vision_monitor_metadata(destination);
 }
 
 volatile uint8_t vis_frame_ready;          // 新帧处理完成（供上行传输层判断数据是否新鲜）
@@ -58,7 +64,7 @@ volatile uint16_t vis_t_sweep_us   = 0;
 volatile uint16_t vis_t_cross_us   = 0;
 volatile uint16_t vis_t_center_us  = 0;
 
- uint8 asc_far = VIS_PREVIEW_ROW_DEFAULT;             // ASC采样远行（顶部行），菜单可调，默认55（Round34）
+ uint8 asc_far = VIS_PREVIEW_ROW_DEFAULT;             // 固定预瞄中心行，默认45；实际采样范围中心±10
 static int16 last_valid_width = 60;            // 最近双边真实路宽（逐行扫描外推基准）
 static int   last_real_width  = 60;            // 近一次双边真实宽度（单边外推基准，发车时清零）
 static uint8 raw_l_border[pho_h];              // 十字补线前的原始左边界（标定用）
@@ -86,8 +92,8 @@ static uint8 raw_r_exist[pho_h];               // 十字补线前的原始右边
 #define CROSS_OBL_JUMP_COL            15    /* 斜入拐点：错边 1~2 行内跳变 >15px */
 #define CROSS_OBL_ROW_MAX             60    /* 斜入检测只扫 y=20..60 的远/中区域 */
 #define CROSS_OBL_DN_GAP               8    /* 斜入上拐点向下至少 8 行再找下拐点 */
-#define CROSS_CONFIRM_FRAMES           2    /* 连续确认帧数 */
-#define CROSS_HOLD_MISSED_FRAMES       2    /* 漏检保持帧数 */
+#define CROSS_CONFIRM_FRAMES           VIS_CROSS_CONFIRM_FRAMES
+#define CROSS_HOLD_MISSED_FRAMES       VIS_CROSS_HOLD_FRAMES
 
 /* 斜入耦合扫线（手动重构版） */
 #define CROSS_USE_OBLIQUE_SWEEP        1
@@ -176,6 +182,7 @@ static uint8 oblique_pending_up_row, oblique_pending_up_col;
 static uint8 oblique_pending_confirm;
 static bool  oblique_valid;
 static bool  cross_oblique_used;         /* 本帧 cross_detect 是否实际采用了斜入 */
+static uint8 cross_oblique_real_side;    /* 与保持拐点一起保存，独立于每帧清零的扫线状态 */
 #endif /* CROSS_USE_OBLIQUE_SWEEP */
 
 /* 斑马线静态变量 */
@@ -272,7 +279,7 @@ static void border_smooth(border_line border)
  * 3. border_smooth(g_vis.center_line) — 平滑中线
  * 4. 窄窗口加权平均: asc_far±10, 权重1.0→5.0递增(远重近轻), 均值=err
  *
- * 调参: asc_far(预瞄中心行,菜单"preview",默认65); 单边→最新真实路宽外推
+ * 调参: asc_far(预瞄中心行,菜单"preview",默认45); 单边→最新真实路宽外推
  * ================================================================ */
 
 /* ================================================================
@@ -943,30 +950,22 @@ static void pho_center(void)
         int r = (int)g_vis.r_border[y];
         int c;
 
-        /* 双边真 → 中点（记录宽度为外推基准）；
-         * 双边有值但至少一侧是估的（单边丢线）→ 同样取中点。
-         *     sweep_boundaries 已经把丢失侧用 last_valid_width 外推并写入边界数组，
-         *     TRACK 显示的两条黄线就是这两个值，所以中线必须用 (l+r)/2 才能落在黄线中央；
-         *     若仍用 last_real_width（上一帧/上方行的旧宽度）外推，会与黄线不一致。
-         * 只有一侧有值 → 最近真实路宽外推；都无 → 白像素重心 */
-        if (l != BORDER_INVALID && r != BORDER_INVALID)
+        /* 显式十字桥接可参与中点；普通单边外推坐标不能冒充真实双边。
+         * 先按未裁剪的真实路宽推中线，再限到画面内，避免缺右侧时被x=187假边拉向中间。 */
+        bool l_valid = l != BORDER_INVALID && (g_vis.l_border_exist[y] || (vision_repair_flags[y]&1u));
+        bool r_valid = r != BORDER_INVALID && (g_vis.r_border_exist[y] || (vision_repair_flags[y]&2u));
+        if (l_valid && r_valid)
         {
-            c = (l + r) / 2;
-            if (g_vis.l_border_exist[y] && g_vis.r_border_exist[y])
+            c = (l+r)/2;
+            if (!vision_repair_flags[y] && g_vis.l_border_exist[y] && g_vis.r_border_exist[y])
             {
-                last_real_width = r - l;
-                if (last_real_width < 20)  last_real_width = 20;
+                last_real_width = r-l;
+                if (last_real_width < 20) last_real_width = 20;
                 if (last_real_width > 160) last_real_width = 160;
             }
         }
-        else if (l != BORDER_INVALID)
-        {
-            c = l + last_real_width / 2;
-        }
-        else if (r != BORDER_INVALID)
-        {
-            c = r - last_real_width / 2;
-        }
+        else if (l_valid) c = l+last_real_width/2;
+        else if (r_valid) c = r-last_real_width/2;
         else
         {
             /* 双边都缺 → 白像素重心。找不到就是真没赛道，标 INVALID 不画绿线。
@@ -1005,6 +1004,8 @@ static void pho_center(void)
     int y_near = y_center + WINDOW_HALF;   // e.g. 50+10=60
     int y_far  = y_center - WINDOW_HALF;   // e.g. 50-10=40
     asc_range_dbg = y_center;
+    vision_sample_far = (uint8)y_far;
+    vision_sample_near = (uint8)y_near;
 
     float total_dev = 0.0f, total_w = 0.0f;
     float w = 1.0f;
@@ -1014,7 +1015,11 @@ static void pho_center(void)
     for (int y = y_near; y >= y_far; y--)
     {
         uint8 c = g_vis.center_line[y];
-        if (c != BORDER_INVALID && c >= 3 && c <= pho_w_max - 3)
+        /* 真实单边外推到0/187仍是有效纠偏目标，不能显示到边缘却丢弃其误差。
+         * 无边界的白重心仍沿用边缘3px过滤，避免把孤立亮点当作可靠中心。 */
+        if (c != BORDER_INVALID &&
+            ((c >= 3 && c <= pho_w_max - 3) || g_vis.l_border_exist[y] ||
+             g_vis.r_border_exist[y] || vision_repair_flags[y]))
         {
             total_dev += ((float)c - (float)pho_center_x) * w;
             total_w   += w;
@@ -1301,51 +1306,18 @@ static void cross_fill_segment(border_line line, uint8 exist[pho_h],
 {
     if (r1 <= r0) return;
 
-    /* ---- 最小二乘拟合：上/下拐点各取 ±2 行共 10 个点 ----
-     * 两点直线对单行锚点噪声太敏感（参考 CSDN qq_53239103 十字补线），
-     * 这里用 x=row, y=col 做 y = k*x + b；点不够 4 个时回退两点直线。 */
-    float sx = 0.0f, sy = 0.0f, sxx = 0.0f, sxy = 0.0f;
-    int   n  = 0;
-    int16 row;
-
-    for (row = (int16)r0 - 2; row <= (int16)r0 + 2; row++)
-    {
-        if (row < 0 || row >= pho_h) continue;
-        if (line[row] == BORDER_INVALID) continue;
-        float x = (float)row;
-        float y = (float)line[row];
-        sx += x; sy += y; sxx += x * x; sxy += x * y; n++;
-    }
-    for (row = (int16)r1 - 2; row <= (int16)r1 + 2; row++)
-    {
-        if (row < 0 || row >= pho_h) continue;
-        if (line[row] == BORDER_INVALID) continue;
-        float x = (float)row;
-        float y = (float)line[row];
-        sx += x; sy += y; sxx += x * x; sxy += x * y; n++;
-    }
-
-    float k, b;
-    bool  use_ls = false;
-    if (n >= 4)
-    {
-        float den = (float)n * sxx - sx * sx;
-        if (den > 0.01f || den < -0.01f)
-        {
-            k = ((float)n * sxy - sx * sy) / den;
-            b = (sy - k * sx) / (float)n;
-            use_ls = true;
-        }
-    }
-    if (!use_ls)
-    {
-        k = (float)((int16)c1 - (int16)c0) / (float)((int16)r1 - (int16)r0);
-        b = (float)c0 - k * (float)r0;
-    }
+    /* 桥接必须经过调用者指定的拐点。旧最小二乘读取附近旧边界，
+     * 会忽略c0/c1，斜入时甚至把“缺边固定到屏幕边缘”拟合成另一条斜线。
+     * 如需平滑应在识别锚点时处理，不能让补线偏离锚点。 */
+    if (r0 >= pho_h || r1 >= pho_h || c0 >= pho_w || c1 >= pho_w) return;
+    float k = (float)((int16)c1-(int16)c0)/(float)((int16)r1-(int16)r0);
+    float b = (float)c0-k*(float)r0;
 
     for (uint16 r = r0; r <= r1; r++)
     {
-        int32 c = (int32)(k * (float)r + b);
+        int32 c = (int32)(k * (float)r + b + 0.5f);
+        if (r == r0) c = c0;
+        if (r == r1) c = c1;
         line[r]  = (uint8)cross_limit_u8(c, 0, MT9V03X_W - 1);
         exist[r] = 1;
         /* 补线也会设置exist=1，所以独立保存补线来源，不能仅靠exist判断。 */
@@ -1363,7 +1335,7 @@ static void cross_repair(void)
     if (cross_oblique_used)
     {
         /* 斜入：有角侧补真实上下拐点，丢线侧补到屏幕边缘 */
-        if (oblique_real_side == 1)   /* 左墙有角 → 补左墙，右墙丢线补 x=187 */
+        if (cross_oblique_real_side == 1)   /* 使用与保持拐点一起保存的方向 */
         {
             cross_fill_segment(g_vis.l_border, g_vis.l_border_exist,
                                cross_up_l_col, cross_up_l_row,
@@ -1504,6 +1476,7 @@ static void cross_detect(void)
         }
         pair_ok = true;
         cross_oblique_used = true;
+        cross_oblique_real_side = oblique_real_side;
     }
 #else
     /* 开关关闭时：保留旧 cross_detect_oblique() 回退 */
@@ -1566,6 +1539,7 @@ void cross_reset(void)
 {
     cross_state          = CROSS_STATE_NONE;
     cross_corners_valid  = false;
+    vision_corners_in_frame = 0;
     cross_confirm_count  = 0;
     cross_missed_count   = 0;
     cross_cand_present   = false;
@@ -1593,6 +1567,7 @@ void cross_reset(void)
     oblique_pending_up_row  = 0;
     oblique_pending_up_col  = 0;
     cross_oblique_used      = false;
+    cross_oblique_real_side = 0;
 #endif
     zebra_prev           = false;
     zebra_detected       = false;   /* 防斑马线上发车：首帧即产生一次虚假ZEBRA上升沿 */
@@ -2104,9 +2079,11 @@ VisionEvent vis_deal(void)
     /* ---- 十字检测 + 补线（覆盖被横道干扰的边界行）----
      * 预检：没有十字候选/斜入候选时跳过整段十字逻辑，优化耗时。 */
     t_stage = timer_get(GPT_TIM_1);
-    if (cross_cand_present || oblique_valid) {
+    vision_corners_in_frame = 0; // 不把未执行十字检测时的旧静态拐点画在新帧上
+    if (cross_cand_present || oblique_valid || cross_state != CROSS_STATE_NONE) {
         cross_detect();
         cross_repair();
+        vision_corners_in_frame = cross_corners_valid;
     }
     vis_t_cross_us = (uint16)(timer_get(GPT_TIM_1) - t_stage);
 
@@ -2171,4 +2148,25 @@ void vis_export_trace(void)
         vis_trace_y_center[n] = (uint8)VIS_TRACE_NONE;
         vis_trace_y_right[n]  = (uint8)VIS_TRACE_NONE;
     }
+}
+
+/* 与原始灰度、边界共用同一帧快照；在线改变前瞻后，绿线随下一帧实际取值更新。 */
+static void vision_monitor_metadata(uint8 *destination)
+{
+    uint8 i;
+    const uint8 corners[8] = {cross_up_l_col, cross_up_l_row, cross_up_r_col, cross_up_r_row,
+                             cross_dn_l_col, cross_dn_l_row, cross_dn_r_col, cross_dn_r_row};
+    memset(destination, BORDER_INVALID, VISION_MONITOR_METADATA_SIZE);
+    destination[0] = vision_sample_far;
+    destination[1] = vision_sample_near;
+    destination[2] = destination[3] = 0;
+    if (!vision_corners_in_frame || !cross_corners_valid) return;
+    for (i = 0; i < 4u; i++)
+    {
+        if (corners[2u*i] >= pho_w || corners[2u*i+1u] >= pho_h) continue;
+        destination[2] |= (uint8)(1u << i);
+        destination[4u+2u*i] = corners[2u*i];
+        destination[5u+2u*i] = corners[2u*i+1u];
+    }
+    if (destination[2]) destination[3] = cross_missed_count ? 3u : (uint8)cross_state;
 }

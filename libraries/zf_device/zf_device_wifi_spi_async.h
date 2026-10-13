@@ -21,9 +21,12 @@ uint8 wifi_spi_async_init(const char *ip, const char *local_port, const char *in
  * length=1..1424，port为电脑UDP目标端口，now_ms为持续更新的板上毫秒时间。
  * 接受不等于发送完成；必须poll到is_busy=0，再查询send_result。 */
 uint8 wifi_spi_send_async(const uint8 *buffer, uint16 length, const char *port, uint32 now_ms);
+uint8 wifi_spi_receive_async(uint32 now_ms); // 空闲时提交只读事务，不发UDP空包
+uint32 wifi_spi_read_async_fifo(uint8 *buffer, uint32 capacity); // 仅FIFO，不同步SPI
 void wifi_spi_send_poll(uint32 now_ms); // 消费完成应答后可直接启动后继DMA，每次最多启动一次，不原地等待
 uint8 wifi_spi_is_busy(void); // 1有在途事务，0可提交
 uint8 wifi_spi_send_result(void); // 最近事务的完成状态，取值见上方enum
 void wifi_spi_send_cancel(void); // 取消在途事务；不发送新UDP包，不同步重连
 
+void wifi_spi_refresh_socket(void); // 非阻塞：下一次发送强制重建UDP socket
 #endif

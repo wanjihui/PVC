@@ -1,10 +1,13 @@
-# 本地工具和说明，不上传到代码仓库
+# 本地工具不上传；说明仅保留顶层文档与调参方案
 /tool/
 /tools/
-/docs/
+/docs/*
+!/docs/*.md
+!/docs/调参方案_*.json
+/docs/README_上传前备份.md
 
 # Keil 编译输出
-/project/mdk/Objects/
+/project/mdk/Objects*/
 /project/mdk/Listings/
 *.o
 *.d

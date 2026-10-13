@@ -6,6 +6,7 @@
 #include <stdio.h>
 
 volatile CarState car_state;
+float ctl_speed_target=CAR_TARGET_SPEED_CMS;
 float ctl_gyro_kd;
 volatile uint8 stop_reason, mt9v03x_finish_flag;
 char wifi_spi_ip_addr_port[] = "test-only";
@@ -14,6 +15,7 @@ static int control_ticks;
 static int key_calls, vision_calls, camera_calls, upload_calls, command;
 static int pending_logs, log_packets, flush_calls, log_poll_calls;
 static uint32 log_at;
+static uint8 mock_online=1;
 void clock_init(int clock) { (void)clock; }
 void debug_init(void) {}
 void motor_init(void) {}
@@ -32,7 +34,8 @@ void wifi_record_service_cost(uint32 cost) { (void)cost; }
 void control_init(void) { car_state = CAR_IDLE; }
 void buttons_init(void) {}
 void pit_ms_init(int channel, int period) { (void)channel; (void)period; }
-uint8 wifi_init(void) { wifi_calls++; return scenario == 3 && wifi_calls == 1 ? 2 : 0; }
+uint8 wifi_init(void) { wifi_calls++; mock_online=1; return scenario == 3 && wifi_calls == 1 ? 2 : 0; }
+uint8 wifi_is_ready(void) { return mock_online; }
 uint8 wifi_flush_log(void)
 {
     flush_calls++;
@@ -146,6 +149,17 @@ int main(int argc, char **argv)
         command = 1;
         app_poll();
         assert(car_state == CAR_RUNNING && upload_calls == previous_uploads + 1);
+        if (scenario == 5)
+        {
+            previous_wifi=wifi_calls;
+            mock_online=0; // Actual WiFi layer reports repeated runtime SPI failures.
+            app_poll();
+            for(i=0;i<1001;i++)app_tick_isr();
+            app_poll();
+            assert(car_state==CAR_RUNNING && wifi_calls==previous_wifi);
+            command=2;app_keys_isr();app_poll();
+            assert(car_state==CAR_IDLE && wifi_calls==previous_wifi+1 && mock_online);
+        }
     }
     puts("PASS: sensor ISR, K1/K2 motion control, parked IMU service, independent init/STOP logs, failed log retry, parked reconnect");
     return 0;

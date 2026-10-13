@@ -1,0 +1,13 @@
+/.venv/
+/build/
+/dist/
+/backups/
+/captures/
+/McarWiFiMonitorData*/
+/pytest-of-*/
+/tools/runtime_temp/
+/tools/release_path.txt
+/tools/*report.json
+/tools/*startup.json
+*.spec
+# release/WiFiSPI_Monitor.exe is the explicitly selected distributable.

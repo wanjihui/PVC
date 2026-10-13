@@ -1,7 +1,7 @@
 /*********************************************************************************************************************
 * 文件名称          control.h
 * 适用平台          RT1064DVL6A
-* 描述              运行状态机 + 视觉→运动决策 + 固定前进速度 + 麦轮运动学调用
+* 描述              运行状态机 + 视觉→运动决策 + 弯道速度规划 + 麦轮运动学调用
 *
 * 分工：
 *       pid.c     内环：四轮速度闭环（200Hz 中断）
@@ -36,17 +36,23 @@ extern float  ctl_omega_kd;
 extern float  ctl_gyro_kd;
 extern float  ctl_omega_max;                                                // 自转角速度限幅（deg/s）
 
-/* 固定前进速度 */
-extern float  ctl_speed_target; // 巡航车体速度cm/s，直弯相同；起步500ms内从0爬升
+/* 直道巡航上限；弯道速度由config限速，且不超过此在线值 */
+extern float  ctl_speed_target; // cm/s；起步500ms包络、降速/出弯恢复均作用于vx
 
 /* 横移（麦轮特有）：把偏差的一部分映射成横向速度，实现"平移贴线"
 * 0 = 完全不用横移（纯航向控制，先用这个上车验证） */
 extern float  ctl_lateral_gain;
 
-/* 弯道降速：|err| 超过 ctl_corner_err_px 后，前进速度最多降到 (1-ctl_corner_slow)。
-* R = v/ω，弯里降速等于直接放大转向能力；ctl_corner_slow = 0 表示关闭。 */
-extern float  ctl_corner_err_px;
-extern float  ctl_corner_slow;
+extern volatile uint32 ctl_ramp_ms; // ms，仅停车调整
+
+/* 弯道规划运行参数；config中的宏提供复位默认值，在线修改不写Flash。 */
+extern uint8 ctl_curve_enable, ctl_curve_confirm_frames;
+extern float ctl_curve_normal_cms, ctl_curve_tight_cms;
+extern float ctl_curve_enter_dps, ctl_curve_tight_dps;
+extern float ctl_curve_exit_dps, ctl_curve_exit_err_px, ctl_curve_exit_gyro_dps;
+extern volatile uint32 ctl_curve_exit_stable_ms, ctl_curve_frame_max_age_ms;
+extern float ctl_curve_decel_cms2, ctl_curve_accel_cms2;
+void control_curve_params_changed(void); // 调参临界区内调用；运行中保留已确认弯级
 
 /* ==================== 运行状态机 ==================== */
 typedef enum
@@ -76,7 +82,7 @@ extern volatile float    vy_dbg;                                            // �
 /* ==================== 接口 ==================== */
 void    control_init(void);                                                 // 初始化（速度环 + 视觉 reset + 零偏）
 void    control_update(void);                                               // 新图像主循环：更新视觉转向/横移缓存，不推进斜坡
-void    control_tick_isr(void);                                             // 每5ms、IMU采样后/PID前：斜坡+陀螺阻尼→四轮目标
+void    control_tick_isr(void);                                             // 每5ms、IMU后/PID前：起步/弯速规划+陀螺阻尼→四轮目标
 void    control_state_launch(void);                                         // IDLE → RUNNING
 void    control_state_stop(uint8 reason);                                   // 立即清PWM → IDLE（记录原因）
 void    control_sync_params(void);                                          // 参数同步（菜单改参后调用）

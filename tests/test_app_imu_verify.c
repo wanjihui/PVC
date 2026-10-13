@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 volatile CarState car_state;
+float ctl_speed_target=CAR_TARGET_SPEED_CMS;
 volatile uint8 Speed_PID_Enable;
 char wifi_spi_ip_addr_port[]="mock";
 static uint32 clock_us;
@@ -24,6 +25,7 @@ void timer_start(int timer) {(void)timer;clock_running=1;}
 void timer_clear(int timer) {(void)timer;if(clock_running)clock_us=0;}
 uint32 timer_get(int timer) {(void)timer;return clock_us;}
 uint8 wifi_init(void) {wifi_initializations++;return scenario==2 && wifi_initializations==1 ? 2 : 0;}
+uint8 wifi_is_ready(void) {return 1;}
 uint8 wifi_flush_log(void) {log_flushes++;return 0;}
 void wifi_poll_imu_verify(uint32 ms) {(void)ms;uploads++;assert(car_state==CAR_IDLE && !Speed_PID_Enable);}
 void wifi_poll_log(uint32 ms) {(void)ms;service_polls++;}

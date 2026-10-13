@@ -77,38 +77,37 @@
 #endif
 
 #define WIFI_UDP_TARGET_IP       "192.168.50.117"
+#ifndef WIFI_SINGLE_PORT_ENABLE
+#define WIFI_SINGLE_PORT_ENABLE  (1) // 1=固定单socket，MUDP类型头区分参数/日志/图像；0=旧三端口
+#endif
+#define WIFI_MONITOR_PORT        "8081" // 单端口上位机监听端口；模块不因包类型重建socket
 #define WIFI_DATA_PORT           "8081"
 #define WIFI_LOG_PORT            "8082"
 #define WIFI_CAMERA_PORT         "8083"
 #define WIFI_UDP_LOCAL_PORT      "6666"
 #define WIFI_DATA_PERIOD_MS      (50)
-#define WIFI_IMAGE_PERIOD_MS     (100) // 上传启动目标10fps；实际完整帧率取决于SPI/网络/主循环
-#define WIFI_CAMERA_BURST_CHUNKS (4u)  // 图像连续小批量发送，减少参数/图像之间的socket切换
+#define WIFI_IMAGE_PERIOD_MS     (66) // 约15fps启动目标；完整帧率仍需用上位机实测
+#define WIFI_CAMERA_BURST_CHUNKS (4u)  // 图像连续小批量发送后让出参数，单端口不切socket
 #define WIFI_CAMERA_BURST_MS     (20u) // 首片完成后的批次时间预算，之后让出最新参数
 
-/* 主循环末尾延时（ms）。图像上传靠"每圈推进一步分片"，所以主循环圈数直接决定帧率上限：
- *   native 模型（tests/native_framework/camera_throughput_after_100_build.log）：
- *     主循环 1ms/圈 + 图像周期100ms → 9.80 fps；主循环 4ms/圈 → 4.00 fps。
- * 设 0 = 主循环全速（图像更快，但空转耗电、日志/按键轮询更密）；设 1 = 与原行为一致。 */
+/* 图像/参数的异步SPI事务靠主循环持续推进，删除每圈1ms的强制等待。
+ * review_camera_poll_rate.py：40MHz SPI、每20ms模拟1.5ms视觉处理时，
+ * 原1ms轮询/100ms上传=8.6fps；100us轮询/66ms上传=14.2fps（软件模型，非实车保证）。
+ * 设0=全速服务；不改变5ms轮速/IMU、10ms按键、相机50Hz和视觉按新帧执行的周期。 */
 #ifndef APP_MAIN_LOOP_DELAY_MS
-#define APP_MAIN_LOOP_DELAY_MS   (1u)
+#define APP_MAIN_LOOP_DELAY_MS   (0u)
 #endif
 
-/* 图像分片"有界补发"：主循环里原本每圈只推进一步分片，一帧 17 片就要 17 圈，
- * 这是真车帧率（实测估算 4~9 fps）最直接的瓶颈。
- * 这里允许同一圈内多推进几步，用两条约束兜住风险：
- *   WIFI_CAMERA_DRAIN_STEPS：一圈最多推进几步（1 = 关闭该功能，与原行为一致）
- *   WIFI_CAMERA_DRAIN_US   ：一圈补发的总时间预算（µs）
- * 另外：本轮若刚处理过新图像，则不补发，保证视觉外环节拍优先。
- * 副作用：补发期间参数包(8081)/日志会被更快推进，但单圈最坏变长到约 1+DRAIN_US。 */
-#ifndef WIFI_CAMERA_DRAIN_STEPS
-#define WIFI_CAMERA_DRAIN_STEPS  (4u)
-#endif
-#ifndef WIFI_CAMERA_DRAIN_US
-#define WIFI_CAMERA_DRAIN_US     (8000u)
-#endif
+#define WIFI_COMMAND_POLL_MS    (10u) // 空闲事务间非阻塞读取模块RX，指令与上传共用SPI
 #define WIFI_LOG_PERIOD_MS       (1000)
 #define WIFI_RETRY_MS            (5000)
+#define WIFI_TX_FAILURE_LIMIT       (3u)   // 连续事务失败后向app报告离线，停车才重新入网
+#define WIFI_FAILURE_BACKOFF_MS     (1000u)
+#define WIFI_STATUS_PERIOD_MS       (3000u) // 低频日志区分停车/主循环进度/SPI故障；0=关闭
+#define WIFI_HOST_TIMEOUT_MS        (8000u) // 首次上位机ALIVE后启用端到端检测
+#define WIFI_HOST_RECOVERY_MS       (5000u) // 先异步重建socket；无回包再停车重入网
+#define VIS_CROSS_CONFIRM_FRAMES    (2u)
+#define VIS_CROSS_HOLD_FRAMES       (4u) // 50Hz下最多保持80ms，随后清除旧补线
 #define IMU_CAL_SAMPLES          (300)
 #define IMU_FUSION_KP            (2.0f)
 
@@ -175,14 +174,12 @@
 * 因此 vision.c 里的 vis_draw()/vis_bin_draw() 与整个菜单模块已移除。 */
 
 /*-------------------------------------- WiFi SPI 模块（高速无线，用于传图像 + 示波器数据） -------------------------------------*/
-/* 目标 IP / 端口在库头文件中配置；暂时不初始化、连接或上传 WiFi SPI。 */
+/* SSID/密码在此配置，IP/三路端口与发送节拍见 wifi.h；app_init入网，app_poll异步收发。 */
 #define WIFI_SSID               "ASC_Circuit"                               // 当前电脑连接的WiFi
 #define WIFI_PASSWORD           "1145141919810"                             // 用户提供的WiFi密码；运行日志不输出
 
-/* 图像上传降频：主循环 50Hz，但一帧 188*120 图像经无线传输耗时较长（百毫秒级），
-* 每帧都传会把主循环拖慢。取 N 表示"每 N 帧传一次"，默认 25 → 约 2Hz。
-* 注意：传输在主循环里做（不在 200Hz 中断），所以**不会影响速度环**，
-*       真正被拖慢的只是视觉帧率；调参时若嫌慢就调小，稳定跑车时应调大或置 0 关闭。 */
+/* 图像目标100ms启动一帧；快照+分片DMA异步推进，不等待无线发送完成。
+ * 实际上位机帧率受主循环推进与丢包影响，视觉仍按摄像头新帧计算。 */
 
 /* 是否上传边界/中线（XY_BOUNDARY，3 条线：左边界/中线/右边界）。
 * 开启后上位机能直接看到算法提取的中线，是无屏调参的主力手段。 */
@@ -243,21 +240,36 @@
  * ω → 四轮（motor.c 的 mecanum_inverse）：
  *      rot[cm/s] = (轴距200+轮距180)/2/1000 × ω[rad/s] × 100 = 0.3316 × ω[deg/s]
  *      FL/RL = vx − rot，FR/RR = vx + rot
- * 转弯半径 R = v/ω：150cm/s 时 120°/s → 72cm（急弯必然转不过去）；240°/s → 36cm；360°/s → 24cm
+ * 转弯半径 R = v/ω：150cm/s 时 120°/s → 72cm（理想无滑移计算）；240°/s → 36cm；360°/s → 24cm
  * 建议调参顺序：KP1（普通偏差的转向力度）→ OMEGA_MAX（急弯能否转过来）→ GYRO_KD（摆头）
  *              → KP2（大偏差补强）→ KD（入弯超调）→ 仍不够再动速度环 SPEED_KP/KI */
-#define CTL_OMEGA_KP1_DEFAULT      (1.60f)  // 线性比例 (deg/s)/px。0.6=转向无力；>2.5 易画龙/超调
-#define CTL_OMEGA_KP2_DEFAULT      (0.012f) // 二次项 (deg/s)/px²，只在 |e|>60px 起作用，专治急弯
-#define CTL_OMEGA_KD_DEFAULT       (0.30f)  // 微分 (deg/s)/(px/帧)：抑制入弯超调；视觉噪声大时不宜再大
-#define CTL_OMEGA_MAX_DPS_DEFAULT  (240.0f) // 自转限幅 (deg/s)：卡住急弯的关键，见上面 R 的算法
-#define CTL_GYRO_KD_DEFAULT        (0.20f)  // 陀螺阻尼 0~1：抑制摆头；过大转向变钝。符号由 IMU_MOUNT_YAW_SIGN 保证
+#define CTL_OMEGA_KP1_DEFAULT      (1.60f)  // 线性比例 (deg/s)/px。普通偏差强度；过大可能摆动，数值需实车迭代
+#define CTL_OMEGA_KP2_DEFAULT      (0.012f) // 二次项 (deg/s)/px²，所有非零e均参与；偏差大时相对线性项更强
+#define CTL_OMEGA_KD_DEFAULT       (0.30f)  // 微分 (deg/s)/(px/帧)：每帧差分，提前响应快速偏差；也会放大视觉噪声
+#define CTL_OMEGA_MAX_DPS_DEFAULT  (240.0f) // 自转限幅 (deg/s)：最大允许指令，理想半径见R公式，实车还受滑移/轮速响应影响
+#define CTL_GYRO_KD_DEFAULT        (0.30f)  // 陀螺阻尼 0~1：抑制摆头；过大转向变钝。符号由 IMU_MOUNT_YAW_SIGN 保证
+#define CTL_PREVIEW_ROW_DEFAULT   (60u)   // 固定预瞄中心行20..100；用户试跑选择60，取值50..70
 #define CTL_DEADBAND_PX_DEFAULT    (2.0f)   // 偏差死区 (px)：直道防抖
-#define CTL_LATERAL_GAIN_DEFAULT   (0.0f)   // 横移 vy 增益：0=关闭（纯航向控制）；麦轮横移贴线可试 0.1~0.5
+#define CTL_LATERAL_GAIN_DEFAULT   (0.10f)  // (cm/s)/px：小幅横移贴线，50px→5cm/s；先试0.10，过冲时减小
 
-/* 弯道降速：|e| 超过 CTL_CORNER_ERR_PX 后，前进速度最多降到 (1−RATIO)。
- * 原理：R = v/ω，弯里降速等于直接放大转向能力；设 RATIO=0 即关闭该功能。 */
-#define CTL_CORNER_ERR_PX_DEFAULT  (100.0f) // 触发降速的偏差门槛 (px)
-#define CTL_CORNER_SLOW_RATIO_DEFAULT (0.45f) // 最大降速比例：150cm/s × (1−0.45) ≈ 82cm/s
+/* 弯道速度规划：固定前瞻不变，用未叠加陀螺阻尼的视觉转向需求分级。
+ * 只降低车体vx，omega/vy及四轮PID继续运行；0可回退直弯同速。 */
+#ifndef CTL_CURVE_SPEED_ENABLE
+#define CTL_CURVE_SPEED_ENABLE     (1)     // 仅视觉循迹模式启用，独立轮速调试不分弯道
+#endif
+#define CTL_CURVE_NORMAL_CMS       (120.0f) // 普通弯规划上限且不超过cruise_cms；过渡按减速率
+#define CTL_CURVE_TIGHT_CMS        (100.0f) // 紧弯规划上限；进入后保持到稳定出弯
+#define CTL_CURVE_ENTER_DPS        (70.0f)  // 普通弯：视觉转向需求绝对值达到此阈值
+#define CTL_CURVE_TIGHT_DPS        (140.0f) // 紧弯：视觉转向需求绝对值达到此阈值
+#define CTL_CURVE_CONFIRM_FRAMES   (2u)    // 连续新帧确认降速等级，单帧D项尖峰不立即分弯
+#define CTL_CURVE_EXIT_DPS         (45.0f) // 出弯视觉需求阈值，低于进入阈值形成滞回
+#define CTL_CURVE_EXIT_ERR_PX      (12.0f) // 出弯像素偏差绝对值需低于此值
+#define CTL_CURVE_EXIT_GYRO_DPS    (40.0f) // 出弯实际角速度绝对值需低于此值
+#define CTL_CURVE_EXIT_STABLE_MS   (200u)  // 上述条件连续成立后允许恢复直道速度
+#define CTL_CURVE_FRAME_MAX_AGE_MS (100u)  // 旧视觉帧超过此年龄，不计稳定时间/不继续加速
+#define CTL_CURVE_DECEL_CMS2       (250.0f) // 目标vx下降速率；每5ms最多下降1.25cm/s
+#define CTL_CURVE_ACCEL_CMS2       (100.0f) // 出弯恢复速率；每5ms最多上升0.50cm/s
+
 
 #define CONTROL_GYRO_KD_DEFAULT (CTL_GYRO_KD_DEFAULT) // 兼容旧名，等价于 CTL_GYRO_KD_DEFAULT
 
@@ -266,39 +278,37 @@
 * Target/Actual 单位统一为 cm/s。轮速 → cm/s 的换算见 encoder.c
 *********************************************************************************************************************/
 /* 待实车调参的初始PI值。Ki为每5ms一步的离散积分系数，不再额外乘周期。
- * 巡航150cm/s；500ms斜坡首拍目标3cm/s，静止时首拍约0.303%反馈输出。
- * 四轮先相同，之后根据目标/实际/占空比曲线分别调整。 */
-/* 2026-10-08 实跑数据（数据记录_20261008_212130）显示：Kp=0.10 时四轮实际速度比目标低 15~20%
- *   FL/RL 目标127 实际122、FR/RR 目标152 实际138 cm/s，而占空比只有 11~17%
- *   → 不是功率不够，是增益太小、跟随太软；转弯时外侧轮提不上速，实际自转速率只有指令的 73%。
- * 本轮提高 Kp/Ki，验证 duty 与 speed 的跟踪误差能否收敛到 ±5cm/s 以内。 */
-#define SPEED_KP_FL             (0.20f)
-#define SPEED_KI_FL             (0.0030f)
+ * 巡航150cm/s；500ms斜坡首拍目标1.5cm/s，静止时FL约0.3315%、FR/RR约0.3015%、RL约0.2715%。
+ * 四轮按前后组起调，之后根据目标/实际/占空比曲线分别调整。 */
+/* 2026-10-12：排除起步0.8秒及末0.5秒后FL/RR平均欠速约9.3/7.4cm/s，
+ * 只小幅提高FL 0.20→0.22、RR 0.18→0.20；FR/RL、Ki及视觉/陀螺参数保持。待实车验证。 */
+#define SPEED_KP_FL             (0.22f)
+#define SPEED_KI_FL             (0.0010f)
 #define SPEED_KD_FL             (0.0f)
 #define SPEED_KP_FR             (0.20f)
-#define SPEED_KI_FR             (0.0030f)
+#define SPEED_KI_FR             (0.0010f)
 #define SPEED_KD_FR             (0.0f)
-#define SPEED_KP_RL             (0.20f)
-#define SPEED_KI_RL             (0.0030f)
+#define SPEED_KP_RL             (0.18f)
+#define SPEED_KI_RL             (0.0010f)
 #define SPEED_KD_RL             (0.0f)
 #define SPEED_KP_RR             (0.20f)
-#define SPEED_KI_RR             (0.0030f)
+#define SPEED_KI_RR             (0.0010f)
 #define SPEED_KD_RR             (0.0f)
-/* 前馈：仅当 Target>Actual（加速）时叠加 duty = Kff*(Target-Actual)，用来减小加速滞后。
+/* 误差附加项（并非按目标速度标定的独立前馈）：仅Target>Actual时叠加 duty = Kff*(Target-Actual)，用来减小加速滞后。
  * 0=关闭；0.02~0.05 起步更跟手；过大会在弯道加速段顶到占空比上限。 */
-#define SPEED_FF                (0.02f)
+#define SPEED_FF                (0.0f)
 
 /*********************************************************************************************************************
 *                                            五、固定前进速度
 *********************************************************************************************************************/
-#define CAR_TARGET_SPEED_CMS    (150.0f) // 固定车体前进速度：直弯同速，cm/s
-#define CAR_START_RAMP_MS       (500u)   // K1后目标vx从0线性升到巡航速度，5ms节拍推进；K2立即停车
+#define CAR_TARGET_SPEED_CMS    (150.0f) // 直道巡航上限cm/s；弯道按CTL_CURVE_*规划
+#define CAR_START_RAMP_MS       (500u)   // K1后0→巡航起步包络；弯中不超过限速，K2立即清PWM
 
 /* 注意：视觉算法参数（前瞻行、Otsu 间隔、滤波行数、斑马线/出界阈值等）
-* 全部集中在 code/vision/vision.h 与 vision.c 内部，以保证 vision.c 与
+* 固定前瞻默认值集中在本文件；其余视觉细节见 code/vision/vision.h 与 vision.c，以保证 vision.c 与
 * summer-smartcar 原文件保持接近逐行一致，便于后续对照原工程调参。
 * 上车最常用的两个入口：
-*       ctl_preview_row（vision.h 的 VIS_PREVIEW_ROW_DEFAULT，固定前瞻中心行）
+*       CTL_PREVIEW_ROW_DEFAULT（本文件，固定前瞻中心行）
 *       VIS_FILTER_BOTTOM_ROWS（底部连通滤波行数，影响视觉耗时） */
 
 /* UART1只保留启动及事件日志备份；运行参数通过UDP上传。 */
@@ -306,7 +316,7 @@
 /*********************************************************************************************************************
 *                                            九、保护阈值
 *********************************************************************************************************************/
-#define STALL_TARGET_MIN_CMS    (120.0f)                                    // 堵转判定：目标速度需高于此值
+#define STALL_TARGET_MIN_CMS    (60.0f)                                     // 覆盖100cm/s弯速；更低启动/慢速阶段不计堵转
 #define STALL_ACTUAL_MAX_CMS    (25.0f )                                    // 堵转判定：四轮实际速度均低于此值
 #define STALL_FRAMES            (15   )                                     // 堵转判定：连续帧数（50Hz 下 15 帧 = 0.3s）
 #define LOST_STOP_FRAMES        (3    )                                     // 出界连续帧数 → 停车
