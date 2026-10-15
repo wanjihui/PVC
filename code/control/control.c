@@ -65,7 +65,14 @@ static uint16 stall_count     = 0;                                          // �
 static uint32 ramp_elapsed_ms = 0; // 只按5ms PIT步进，与主循环/WiFi/摄像头刷新快慢无关
 static volatile float vision_omega_command = 0.0f, vision_vy_command = 0.0f;
 #if APP_VISION_TRACKING_ENABLE
+static uint8 observed_curve_level, observed_candidate, observed_confirm; // 停车视觉预览，独立于实际速度规划状态
+static float observed_error_last; // 只供预览D项，不污染发车转向D项
 static volatile uint8 curve_level = 0; // 0直道、1普通弯、2紧弯；单弯只升级，稳定出弯才释放
+uint8 control_curve_level(void)
+{
+    if (car_state != CAR_RUNNING) return observed_curve_level; // 停车仍展示最新图像的弯道判断
+    return ctl_curve_enable ? curve_level : 0u;
+}
 static uint8 curve_candidate = 0, curve_confirm_count = 0; // 主循环连续新帧确认状态
 static uint32 curve_stable_ms = 0; // 5ms节拍累积真实低转速/小偏差稳定时长
 static volatile uint32 curve_frame_age_ms = CTL_CURVE_FRAME_MAX_AGE_MS; // 最近视觉指令年龄
@@ -132,6 +139,25 @@ static void curve_speed_tick(uint8 launching)
 }
 #endif
 
+/* 每张新图像都更新预览；不写轮速目标、PWM、规划弯级或运行转向D缓存。
+ * 用相同视觉P/二次P/D和70/140阈值，连续新帧确认；停车可上下切换。
+ * RUNNING上位机仍报告实际限速弯级，含原来的出弯保持。 */
+void control_observe_vision(void)
+{
+#if APP_VISION_TRACKING_ENABLE
+    float e = g_vis.err;
+    if (e < ctl_deadband && e > -ctl_deadband) e = 0.0f;
+    float demand = ctl_omega_kp1 * e + ctl_omega_kp2 * e * (e >= 0 ? e : -e)
+                 + ctl_omega_kd * (e - observed_error_last);
+    observed_error_last = e;
+    if (demand < 0.0f) demand = -demand;
+    uint8 requested = demand >= ctl_curve_tight_dps ? 2u : (demand >= ctl_curve_enter_dps ? 1u : 0u);
+    if (requested != observed_candidate) { observed_candidate = requested; observed_confirm = 0; }
+    if (observed_confirm < ctl_curve_confirm_frames) observed_confirm++;
+    if (observed_confirm >= ctl_curve_confirm_frames) observed_curve_level = requested;
+#endif
+}
+
 void control_curve_params_changed(void)
 {
 #if APP_VISION_TRACKING_ENABLE
@@ -150,6 +176,10 @@ void control_init(void)
 {
     control_sync_params();
     Speed_PID_Init();
+#if APP_VISION_TRACKING_ENABLE
+    observed_curve_level = observed_candidate = observed_confirm = 0;
+    observed_error_last = 0.0f;
+#endif
 #if APP_VISION_TRACKING_ENABLE
     vision_reset();
     cross_reset();

@@ -103,6 +103,14 @@ def verify_size(width, height, directory):
         monitor.frame = Frame(188, 120, 7, bytes([128] * 22560), time.time(), ('127.0.0.1', 18083))
         monitor.show_page('camera')
         render(monitor)
+        # Verify the real camera-page widget, independent of camera image receipt.
+        for level, label in ((0, '直道'), (1, '小弯'), (2, '紧弯')):
+            monitor.curve_state, monitor.curve_level, monitor.curve_stamp = 'ok', level, time.time()
+            render(monitor, 2)
+            assert label in dpg.get_value('camera_curve_status')
+        monitor.curve_stamp = time.time() - 2
+        render(monitor, 2)
+        assert '过期' in dpg.get_value('camera_curve_status')
         camera = camera_metrics()
         actual = [dpg.get_viewport_width(), dpg.get_viewport_height()]
         assert monitor.shown_frame is monitor.frame

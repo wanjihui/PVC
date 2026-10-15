@@ -148,6 +148,7 @@ static uint8 app_vision_poll(void)
     /* vis_deal做二值化、滤波、搜边/补线、中线与固定前瞻偏差计算，更新g_vis。
      * 返回的是赛道事件；图像偏差由control_update从g_vis.err读取。 */
     event = vis_deal();
+    control_observe_vision(); // 与图像一样不受K1控制，即使不允许驱动也可观察直/小/紧弯
     if (!drive_allowed) return 1; // 仍有图像可供上位机观察，只是不产生运动指令
     previous = car_state;
     if (car_state == CAR_RUNNING)

@@ -18,7 +18,8 @@ import traceback
 import uuid
 
 import dearpygui.dearpygui as dpg
-from packet_parser import DEFAULT_RULES, MONITOR_RULES, SPEED_RULES, TRACK_RULES, TYPE_FORMATS, FieldRule, parse_packet
+from packet_parser import (DEFAULT_RULES, MONITOR_RULES, SPEED_RULES, TRACK_RULES, TYPE_FORMATS,
+                           FieldRule, curve_status, decode_curve_level, parse_packet)
 from transport import UdpReceiver, MultiplexReceiver, send_udp
 from link_health import LinkHealth
 from debug_log import LineDecoder, LogLine
@@ -69,6 +70,21 @@ def camera_display_rect(frame_width, frame_height, canvas_width, canvas_height, 
     scale = min(canvas_width/frame_width,canvas_height/frame_height) if fit else max(1,zoom)
     width,height = frame_width*scale,frame_height*scale
     return width,height,max(0,(canvas_width-width)/2),max(0,(canvas_height-height)/2)
+
+# Colour by display state so unavailable/invalid/stale stay visibly distinct.
+CURVE_STATUS_COLORS = {'ok':(105,205,145),'stale':(255,190,75),
+                       'invalid':(255,120,120),'unavailable':(142,150,164)}
+
+def merge_curve_level(values, packet):
+    """Record the 152-byte track extension even when the saved rules omit it.
+
+    Returns ``(state, level)`` from :func:`decode_curve_level`; a short legacy
+    packet leaves ``values`` untouched and reports ``unavailable``.
+    """
+    state, level = decode_curve_level(packet)
+    if state != 'unavailable':
+        values['curve_level'] = level
+    return state, level
 
 class Monitor:
     def __init__(self, args):
@@ -144,7 +160,12 @@ class Monitor:
         self._layout_size = None
         self._pose_signature = None
         self._camera_display_signature = None
+        self.curve_state, self.curve_level, self.curve_stamp = 'unavailable', None, 0.0
         self._build()
+
+    def reset_curve_status(self):
+        """Forget the held curve state after a restart or receiver switch."""
+        self.curve_state, self.curve_level, self.curve_stamp = 'unavailable', None, 0.0
 
     def status(self, text):
         dpg.set_value('status',text if len(text) <= 46 else text.split('：',1)[0]+'；详见运行日志。')
@@ -367,6 +388,8 @@ class Monitor:
                                 dpg.add_button(label='保存当前画面',callback=self.guard(self.save_frame))
                                 dpg.add_button(label='图像传输设置',callback=lambda:self.show_page('params'))
                         dpg.add_text('等待完整图像',tag='camera_stats',wrap=1250)
+                        dpg.add_text(curve_status('unavailable').text,tag='camera_curve_status',
+                                     color=CURVE_STATUS_COLORS['unavailable'],wrap=1250)
                         dpg.add_text('',tag='camera_display_info',color=(142,150,164),wrap=1250)
                         dpg.add_text('边界/中线/补线及拐点隐藏顶部和底部20行；取值绿线贯穿图像宽度。',tag='camera_annotation_info',color=(142,150,164),wrap=1250)
                         with dpg.child_window(tag='camera_canvas',height=-1,width=-1,horizontal_scrollbar=True,
@@ -486,7 +509,7 @@ class Monitor:
         dpg.configure_item('camera_toolbar',horizontal=content_width >= 1200)
         # Smaller windows scroll vertically rather than hiding settings or logs.
         dpg.configure_item('running_logs',height=max(265,int(height)-760))
-        for tag in ('params_intro','camera_intro','camera_stats','camera_display_info','camera_annotation_info','image_protocol_note','image_connection_status'):
+        for tag in ('params_intro','camera_intro','camera_stats','camera_curve_status','camera_display_info','camera_annotation_info','image_protocol_note','image_connection_status'):
             dpg.configure_item(tag,wrap=content_width)
         for tag in ('quick_intro','quick_target','quick_help','quick_binary_help','quick_status'):
             dpg.configure_item(tag,wrap=content_width)
@@ -796,6 +819,9 @@ class Monitor:
                     dpg.add_text(rule.name)
                     dpg.add_text('—',tag='value_'+rule.name)
                 self._plot_names.append(rule.name)
+            # Recorded independently of the selected rules, so history stays
+            # appendable even when an old saved rule list omits curve_level.
+            self.history.setdefault('curve_level',deque(maxlen=self.max_samples))
         return rules
 
     def start(self):
@@ -826,6 +852,7 @@ class Monitor:
 
     def _start_receiver(self, name):
         receiver = self.receivers[name]
+        self.reset_curve_status()
         address = (dpg.get_value('bind_ip').strip(),dpg.get_value(name+'_port'))
         if any(other != name and self.receivers[other].running and bound[1] == address[1]
                for other,bound in self.bindings.items()):
@@ -849,6 +876,7 @@ class Monitor:
         self.append_logs(self.decoder.flush())
         self.decoder = LineDecoder(dpg.get_value('log_encoding'))
         self.camera = CameraAssembler()
+        self.reset_curve_status()
         self.multiplex.start(*address)
         self.bindings = {name:address for name in self.receivers}
 
@@ -860,6 +888,7 @@ class Monitor:
             dpg.set_value('receive_mode','单端口 MUDP' if self.single_port else '旧版三端口')
             raise ValueError('先停止监听，再切换接收模式')
         self.receive()
+        self.reset_curve_status()
         self.append_logs(self.decoder.flush())
         self.single_port = requested
         self.multiplex = MultiplexReceiver() if requested else None
@@ -900,6 +929,7 @@ class Monitor:
         # Process the last queued records before flushing partial text.
         while any(not receiver.queue.empty() for receiver in self.receivers.values()):
             self.receive()
+        self.reset_curve_status()
         self.append_logs(self.decoder.flush())
         self.tuning.invalidate('上位机已停止监听')
         self.status('接收已停止。已收到的数据和日志仍保存在本地。')
@@ -968,6 +998,10 @@ class Monitor:
             self.multiplex.route()
         for packet in self.receivers['data'].drain(300):
             values, errors = parse_packet(packet.data,self.rules)
+            # Read the controller curve state straight from the DATA packet,
+            # independently of whichever rules are selected.
+            self.curve_state, self.curve_level = merge_curve_level(values, packet.data)
+            self.curve_stamp = packet.stamp
             for name in errors:
                 self.latest.pop(name,None)
             self.latest.update(values)
@@ -984,7 +1018,7 @@ class Monitor:
                                                     address=packet.address,values=values),ensure_ascii=False)+'\n')
                 self.data_records += 1
                 for name,value in values.items():
-                    self.history[name].append((packet.stamp,value))
+                    self.history.setdefault(name,deque(maxlen=self.max_samples)).append((packet.stamp,value))
             if errors:
                 message = '解析错误：'+'；'.join(f'{k}: {v}' for k,v in errors.items())
                 if message != self._last_error:
@@ -1140,6 +1174,11 @@ class Monitor:
             self.resize_camera_display()
             details = f'{frame.width}×{frame.height} / 帧 {frame.frame_id} / {len(self.camera_times)} fps / {wall-frame.stamp:.1f} 秒前' if frame else '等待完整图像'
             dpg.set_value('camera_stats',f'{details}；完整 {self.camera.completed} 帧，未完整/超时 {self.camera.lost}，无效/CRC {self.camera.invalid}，重复包 {self.camera.duplicates}，旧帧 {self.camera.stale}')
+            # Staleness uses the DATA packet stamp only; camera frames never refresh it.
+            curve_age = (wall-self.curve_stamp) if self.curve_stamp else None
+            curve = curve_status(self.curve_state,self.curve_level,curve_age)
+            dpg.set_value('camera_curve_status',curve.text)
+            dpg.configure_item('camera_curve_status',color=CURVE_STATUS_COLORS[curve.state])
             annotation = '等待本帧实际取值范围和拐点'
             displayed = self.shown_frame
             if displayed:

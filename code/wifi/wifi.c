@@ -286,6 +286,7 @@ void wifi_poll(uint32 now, uint8 new_camera_frame)
 #endif
             timing[3] = service_last_us; timing[4] = service_peak_us;
             monitor_vision_fields(data_packet, commands, timing);
+            monitor_put_u32(data_packet + 148, control_curve_level());
             pending_data = 1;
         }
         else pending_data = 0; // 初始化失败只发日志，不用NaN伪造参数。
@@ -307,7 +308,7 @@ void wifi_poll(uint32 now, uint8 new_camera_frame)
 
 #if APP_IMU_VERIFY_ENABLE
 /* IMU 符号验证：不依赖 car_state，只提交 angles/gyro_dps/acc_g 三个三元组。
- * 参数包仍是 148 字节且前 36 字节与正常模式完全一致，上位机用同一解析器即可。
+ * 参数包为152字节，保留原148字节前缀；验证模式弯级字段为0，上位机用同一解析器。
  * 编码器/轮速/视觉字段填0；保留原有字段含义，采样计数使用imu.sample_count。 */
 void wifi_poll_imu_verify(uint32 now)
 {
@@ -333,6 +334,7 @@ void wifi_poll_imu_verify(uint32 now)
     timing[3] = service_last_us;
     timing[4] = service_peak_us;
     monitor_vision_fields(data_packet, commands, timing);
+    monitor_put_u32(data_packet + 148, 0u); // IMU验证模式无弯道规划
     pending_data = 1;
 }
 #endif

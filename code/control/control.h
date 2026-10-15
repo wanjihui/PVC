@@ -53,6 +53,8 @@ extern float ctl_curve_exit_dps, ctl_curve_exit_err_px, ctl_curve_exit_gyro_dps;
 extern volatile uint32 ctl_curve_exit_stable_ms, ctl_curve_frame_max_age_ms;
 extern float ctl_curve_decel_cms2, ctl_curve_accel_cms2;
 void control_curve_params_changed(void); // 调参临界区内调用；运行中保留已确认弯级
+uint8 control_curve_level(void); // 运行返回实际规划弯级；停车返回视觉预览弯级，0直/1小/2紧
+void control_observe_vision(void); // 每张新图像更新预览；不启用电机、不改变运行规划
 
 /* ==================== 运行状态机 ==================== */
 typedef enum

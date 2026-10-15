@@ -7,7 +7,7 @@
 #define MONITOR_CAMERA_CHUNK_SIZE 1400u
 #define MONITOR_BASE_DATA_SIZE 60u
 #define MONITOR_SPEED_DATA_SIZE 108u
-#define MONITOR_DATA_SIZE 148u // 保留108字节前缀，追加视觉指令和实际处理/通信耗时
+#define MONITOR_DATA_SIZE 152u // 保留148字节前缀，偏移148追加uint32实际弯级0/1/2
 #define MONITOR_MUX_HEADER_SIZE 8u // MUDP魔数4字节、版本1、类型1、负载长度2（小端）
 #define MONITOR_MUX_DATA 1u // 内层保持原148字节参数及字段偏移
 #define MONITOR_MUX_LOG 2u // 内层为原日志字节，允许一行跨多个包
